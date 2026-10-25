@@ -32,8 +32,8 @@
 
 (ert-deftest org-todoist--test--first-parent-of-type ()
   (let* ((ast (org-todoist--generate-sample-ast))
-         (task (org-todoist--get-by-id org-todoist--task-type "3" ast))
-         (section (org-todoist--get-by-id org-todoist--section-type "2" ast)))
+         (task (org-todoist--get-by-id org-todoist--task-type "T2aBCdeF" ast))
+         (section (org-todoist--get-by-id org-todoist--section-type "S1aBCdeF" ast)))
     (should (eq (org-todoist--first-parent-of-type task 'headline)
                 section))))
 
@@ -41,8 +41,9 @@
   (let* ((task (org-todoist--test-task))
          (planning (org-todoist--get-planning task))
          (schtimestamp (org-element-property :scheduled planning)))
-    (should (string-equal "2024-12-31T23:59:00.0" (org-todoist--get-planning-date task :scheduled)))
-    (should (string-equal "2024-12-31T23:59:00.0" (org-todoist--date-to-todoist schtimestamp)))))
+    (should (string-equal "2024-12-31T23:59:00" (org-todoist--get-planning-date task :scheduled)))
+    (should (string-equal "2024-12-31T23:59:00" (org-todoist--date-to-todoist schtimestamp)))
+    (should (string-equal "2025-01-01T00:01:00" (org-todoist--get-planning-date task :deadline)))))
 
 (ert-deftest org-todoist--test--task-is-recurring ()
   (should (org-todoist--task-is-recurring (org-todoist--test-recurring-task))))
@@ -56,10 +57,35 @@
     (org-todoist--replace-description task text)
     (should (string-equal text (org-todoist--description-text task)))))
 
+(defmacro org-todoist--test-with-tz (zone &rest body)
+  "Run BODY with the local time zone set to ZONE."
+  (declare (indent 1))
+  `(let ((old-tz (getenv "TZ")))
+     (unwind-protect (progn (set-time-zone-rule ,zone) ,@body)
+       (set-time-zone-rule old-tz))))
+
 (ert-deftest org-todoist--test--timestamp-to-utc-str ()
-  (let* ((ts (org-timestamp-from-string "<2025-01-01 23:30>"))
-         (str (org-todoist--timestamp-to-utc-str ts)))
-    (should (string= str "2025-01-02T07:30:00.0Z"))))
+  (org-todoist--test-with-tz "America/Los_Angeles"
+    (should (string= (org-todoist--timestamp-to-utc-str
+                      (org-timestamp-from-string "<2025-01-01 23:30>"))
+                     "2025-01-02T07:30:00.0Z"))
+    ;; Daylight saving: the offset in July differs from the one in January.
+    (should (string= (org-todoist--timestamp-to-utc-str
+                      (org-timestamp-from-string "<2025-07-01 23:30>"))
+                     "2025-07-02T06:30:00.0Z"))))
+
+(ert-deftest org-todoist--test--timestamp-from-utc-str ()
+  (org-todoist--test-with-tz "America/Los_Angeles"
+    (should (string= (org-element-property :raw-value
+                                           (org-todoist--timestamp-from-utc-str "2025-01-02T07:30:00Z" t))
+                     "<2025-01-01 Wed 23:30>"))
+    (should (string= (org-element-property :raw-value
+                                           (org-todoist--timestamp-from-utc-str "2025-07-02T06:30:00Z" t))
+                     "<2025-07-01 Tue 23:30>"))
+    ;; date-only values must not shift across the date line
+    (should (string= (org-element-property :raw-value
+                                           (org-todoist--timestamp-from-utc-str "2025-07-02Z"))
+                     "<2025-07-02 Wed>"))))
 
 ;; (ert-deftest org-todoist--test--schedule ()
 ;;   (let ((task (json-read-file "sample-task.json"))
@@ -103,7 +129,7 @@
     (with-temp-buffer (insert (org-todoist-org-element-to-string node))
                       (org-mode)
                       (let* ((ast (org-element-parse-buffer))
-                             (task (org-todoist--get-by-id org-todoist--task-type "3" ast))
+                             (task (org-todoist--get-by-id org-todoist--task-type "T2aBCdeF" ast))
                              (tags (org-element-property :tags task)))
                         (should (-contains-p tags org-archive-tag))))))
 
@@ -143,7 +169,7 @@ More description
   (let* ((ast (org-todoist--generate-sample-ast))
          (task (org-todoist--test-task))
          (project (org-todoist--get-parent-of-type org-todoist--project-type task t)))
-    (should (equal (org-todoist--get-prop project "ID") "1"))))
+    (should (equal (org-todoist--get-prop project "tid") "P1aBCdeF"))))
 
 (ert-deftest org-todoist--test--insert-identifier ()
   "Tests adding the org-todoist--type property to a property drawer, creating it if necessary"
@@ -192,7 +218,7 @@ More description
                  ("5:30pm" (17 30))
                  ("9am" (9 0))
                  ("at 15:45" (15 45))
-                 ("3" (3 0)))))
+                 ("3" nil))))
     (dolist (case cases)
       (should (equal (org-todoist--parse-time-component (car case))
                     (cadr case))))))
@@ -214,7 +240,7 @@ More description
   "Test parsing intervals from strings"
   (let ((cases '(("every other" 2)
                  ("every 3rd" 3)
-                 ("every" 1)
+                 ("every" nil)
                  ("every 5th" 5))))
     (dolist (case cases)
       (should (equal (org-todoist--parse-interval (car case))
@@ -418,11 +444,11 @@ Returns nil if not present"
 (defun org-todoist--generate-sample-ast ()
   (org-todoist--generate-ast (file-to-string (expand-file-name "sample.org"))))
 
-(defun org-todoist--test-task () (org-todoist--get-by-id org-todoist--task-type "3" (org-todoist--generate-sample-ast)))
-(defun org-todoist--test-subtask () (org-todoist--get-by-id org-todoist--task-type "777" (org-todoist--generate-sample-ast)))
-(defun org-todoist--test-recurring-task () (org-todoist--get-by-id org-todoist--task-type "3333333" (org-todoist--generate-sample-ast)))
-(defun org-todoist--test-task-section () (org-todoist--get-by-id org-todoist--section-type "555" (org-todoist--generate-sample-ast)))
-(defun org-todoist--test-task-done () (org-todoist--get-by-id org-todoist--task-type "8888" (org-todoist--generate-sample-ast)))
+(defun org-todoist--test-task () (org-todoist--get-by-id org-todoist--task-type "T2aBCdeF" (org-todoist--generate-sample-ast)))
+(defun org-todoist--test-subtask () (org-todoist--get-by-id org-todoist--task-type "T3aBCdeF" (org-todoist--generate-sample-ast)))
+(defun org-todoist--test-recurring-task () (org-todoist--get-by-id org-todoist--task-type "T4aBCdeF" (org-todoist--generate-sample-ast)))
+(defun org-todoist--test-task-section () (org-todoist--get-by-id org-todoist--section-type "S1aBCdeF" (org-todoist--generate-sample-ast)))
+(defun org-todoist--test-task-done () (org-todoist--get-by-id org-todoist--task-type "T1aBCdeF" (org-todoist--generate-sample-ast)))
 
                                         ;Test Data;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 (defvar test-org-str  "#+title: Test
@@ -661,3 +687,274 @@ paragraph
   (let ((hl (org-element-create 'headline `(:title "x" :level 1 :tags ("old" ,org-archive-tag)))))
     (org-todoist--set-labels hl '("new"))
     (should (equal (org-element-property :tags hl) `("new" ,org-archive-tag)))))
+
+;; item_move, levels, id index
+
+(ert-deftest org-todoist--test--item-move-args ()
+  ;; nothing changed
+  (should-not (org-todoist--item-move-args nil "s1" "p1" nil "s1" "p1"))
+  (should-not (org-todoist--item-move-args nil nil "p1" nil nil "p1"))
+  ;; new parent
+  (should (equal (org-todoist--item-move-args "t2" "s1" "p1" "t1" "s1" "p1") '("parent_id" . "t2")))
+  ;; parent unchanged: subtask follows its parent even if section/project changed
+  (should-not (org-todoist--item-move-args "t1" "s2" "p2" "t1" "s1" "p1"))
+  ;; promoted subtask keeps its section
+  (should (equal (org-todoist--item-move-args nil "s1" "p1" "t1" "s1" "p1") '("section_id" . "s1")))
+  ;; promoted subtask in the default section
+  (should (equal (org-todoist--item-move-args nil nil "p1" "t1" nil "p1") '("project_id" . "p1")))
+  ;; moved to another section
+  (should (equal (org-todoist--item-move-args nil "s2" "p1" nil "s1" "p1") '("section_id" . "s2")))
+  ;; moved from a section to the default section: project_id, never a null section_id
+  (should (equal (org-todoist--item-move-args nil nil "p1" nil "s1" "p1") '("project_id" . "p1")))
+  ;; moved to another project's default section
+  (should (equal (org-todoist--item-move-args nil nil "p2" nil nil "p1") '("project_id" . "p2")))
+  ;; whole section moved to another project: its tasks do not move
+  (should-not (org-todoist--item-move-args nil "s1" "p2" nil "s1" "p1")))
+
+(ert-deftest org-todoist--test--adopt-sub-fixes-levels ()
+  (let* ((ast (org-todoist--generate-ast "* P\n** S\n*** T\n**** Sub\n** S2\n"))
+         (s2 (org-element-map ast 'headline (lambda (h) (when (equal (org-element-property :raw-value h) "S2") h)) nil t))
+         (task (org-element-map ast 'headline (lambda (h) (when (equal (org-element-property :raw-value h) "T") h)) nil t))
+         (sub (org-element-map ast 'headline (lambda (h) (when (equal (org-element-property :raw-value h) "Sub") h)) nil t)))
+    (org-todoist--adopt-sub s2 task)
+    (should (= 3 (org-element-property :level task)))
+    (should (= 4 (org-element-property :level sub)))
+    ;; moving up a level also shifts descendants
+    (let ((p (org-element-map ast 'headline (lambda (h) (when (equal (org-element-property :raw-value h) "P") h)) nil t)))
+      (org-todoist--adopt-sub p task)
+      (should (= 2 (org-element-property :level task)))
+      (should (= 3 (org-element-property :level sub))))))
+
+(ert-deftest org-todoist--test--id-index ()
+  (let* ((ast (org-todoist--generate-sample-ast))
+         (index (org-todoist--build-id-index ast)))
+    (should (eq (org-todoist--index-lookup index nil "T2aBCdeF")
+                (org-todoist--get-by-id nil "T2aBCdeF" ast)))
+    (should (org-todoist--index-lookup index org-todoist--task-type "T2aBCdeF"))
+    (should-not (org-todoist--index-lookup index org-todoist--section-type "T2aBCdeF"))
+    (should-not (org-todoist--index-lookup index nil nil))
+    (should-not (org-todoist--index-lookup (org-todoist--build-id-index nil) nil "T2aBCdeF"))))
+
+;; push
+
+(defun org-todoist--test-push (new old)
+  "Run `org-todoist--push' on org strings NEW and OLD.
+Return a list of (TYPE . ARGS) per command."
+  (let ((org-todoist-delete-remote-items nil))
+    (mapcar (lambda (c) (cons (assoc-default "type" c) (assoc-default "args" c)))
+            (org-todoist--push (org-todoist--generate-ast new)
+                               (and old (org-todoist--generate-ast old))))))
+
+(defun org-todoist--test-tree (&rest tasks)
+  "Build org text for project p1 with sections s1/s2, holding TASKS.
+Each element of TASKS is a (SECTION-ID . TASK-ORG) cons; TASK-ORG is a
+string of headlines to place under that section (\"default\" section holds
+unsectioned tasks)."
+  (let ((secs '("default" "s1" "s2")))
+    (concat
+     "* P\n:PROPERTIES:\n:TODOIST_TYPE: PROJECT\n:tid: p1\n:END:\n"
+     (mapconcat
+      (lambda (sec)
+        (concat "** " (if (equal sec "default") "Default Section" (concat "Section " sec))
+                "\n:PROPERTIES:\n:TODOIST_TYPE: SECTION\n:tid: " sec "\n:END:\n"
+                (mapconcat #'cdr (--filter (equal (car it) sec) tasks) "")))
+      secs ""))))
+
+(defun org-todoist--test-task-org (id title &optional level todo)
+  (format "%s %s%s\n:PROPERTIES:\n:TODOIST_TYPE: TASK\n:tid: %s\n:END:\n"
+          (make-string (or level 3) ?*) (or todo "TODO ") title id))
+
+(ert-deftest org-todoist--test--push-new-tree-order ()
+  (let* ((cmds (org-todoist--test-push "* New project\n** Sec\n*** TODO Parent\n**** TODO Child\n" ""))
+         (types (mapcar #'car cmds)))
+    (should (equal (seq-take types 4) '("project_add" "section_add" "item_add" "item_add")))
+    ;; the Child must come after Parent so Parent's temp id exists
+    (let ((parent (nth 2 cmds)) (child (nth 3 cmds)))
+      (should (equal (assoc-default "content" (cdr parent)) "Parent"))
+      (should (equal (assoc-default "content" (cdr child)) "Child"))
+      (should (equal (assoc-default "parent_id" (cdr child))
+                     (assoc-default "parent_id" (cdr child))))
+      (should (assoc-default "parent_id" (cdr child))))
+    ;; no pointless item_update for tasks without a due date
+    (should-not (member "item_update" types))))
+
+(ert-deftest org-todoist--test--push-no-change ()
+  (let ((tree (org-todoist--test-tree (cons "s1" (org-todoist--test-task-org "t1" "Task")))))
+    (should-not (org-todoist--test-push tree tree))))
+
+(ert-deftest org-todoist--test--push-minimal-update ()
+  (let* ((old (org-todoist--test-tree (cons "s1" (org-todoist--test-task-org "t1" "Task"))))
+         (new (org-todoist--test-tree (cons "s1" (org-todoist--test-task-org "t1" "Task two"))))
+         (cmds (org-todoist--test-push new old)))
+    (should (= 1 (length cmds)))
+    (should (equal (car (car cmds)) "item_update"))
+    (should (equal (cdr (car cmds)) '(("id" . "t1") ("content" . "Task two"))))))
+
+(ert-deftest org-todoist--test--push-complete-without-closed ()
+  (let* ((old (org-todoist--test-tree (cons "s1" (org-todoist--test-task-org "t1" "Task"))))
+         (new (org-todoist--test-tree (cons "s1" (org-todoist--test-task-org "t1" "Task" 3 "DONE "))))
+         (cmds (org-todoist--test-push new old)))
+    (should (equal (mapcar #'car cmds) '("item_complete")))
+    (should-not (assoc "date_completed" (cdr (car cmds))))))
+
+(ert-deftest org-todoist--test--push-promote-subtask ()
+  (let* ((old (org-todoist--test-tree
+               (cons "s1" (concat (org-todoist--test-task-org "t1" "Parent")
+                                  (org-todoist--test-task-org "t2" "Child" 4)))))
+         (new (org-todoist--test-tree
+               (cons "s1" (concat (org-todoist--test-task-org "t1" "Parent")
+                                  (org-todoist--test-task-org "t2" "Child" 3)))))
+         (cmds (org-todoist--test-push new old)))
+    (should (equal cmds '(("item_move" ("id" . "t2") ("section_id" . "s1")))))))
+
+(ert-deftest org-todoist--test--push-move-to-default-section ()
+  (let* ((old (org-todoist--test-tree (cons "s1" (org-todoist--test-task-org "t1" "Task"))))
+         (new (org-todoist--test-tree (cons "default" (org-todoist--test-task-org "t1" "Task"))))
+         (cmds (org-todoist--test-push new old)))
+    (should (equal cmds '(("item_move" ("id" . "t1") ("project_id" . "p1")))))))
+
+(ert-deftest org-todoist--test--push-move-between-sections ()
+  (let* ((old (org-todoist--test-tree (cons "s1" (org-todoist--test-task-org "t1" "Task"))))
+         (new (org-todoist--test-tree (cons "s2" (org-todoist--test-task-org "t1" "Task"))))
+         (cmds (org-todoist--test-push new old)))
+    (should (equal cmds '(("item_move" ("id" . "t1") ("section_id" . "s2")))))))
+
+(ert-deftest org-todoist--test--push-task-missing-from-snapshot ()
+  (let* ((old (org-todoist--test-tree (cons "s1" (org-todoist--test-task-org "t1" "Task"))))
+         (new (org-todoist--test-tree (cons "s1" (concat (org-todoist--test-task-org "t1" "Task")
+                                                         (org-todoist--test-task-org "t9" "Copied in")))))
+         (cmds (org-todoist--test-push new old)))
+    ;; a task with an id the snapshot has never seen is pushed as an update
+    (should (equal (mapcar #'car cmds) '("item_update")))
+    (should (equal (assoc-default "id" (cdr (car cmds))) "t9"))
+    ;; but with no snapshot at all nothing is pushed for existing items
+    (should-not (cl-find "item_update" (org-todoist--test-push new nil) :key #'car :test #'equal))))
+
+;; parse-response and the persisted state
+
+(defconst org-todoist--test-response
+  "{\"sync_token\":\"tok2\",\"full_sync\":true,\"temp_id_mapping\":{},
+\"projects\":[{\"id\":\"p1\",\"name\":\"Proj\",\"parent_id\":null,\"is_deleted\":false,\"is_archived\":false,\"child_order\":1}],
+\"sections\":[{\"id\":\"s1\",\"name\":\"Sec\",\"project_id\":\"p1\",\"is_deleted\":false,\"is_archived\":false,\"section_order\":1}],
+\"items\":[{\"id\":\"t1\",\"content\":\"Buy milk\",\"description\":\"2 litres\",\"project_id\":\"p1\",\"section_id\":\"s1\",\"parent_id\":null,\"priority\":4,\"labels\":[\"home\"],\"checked\":false,\"is_deleted\":false,\"due\":{\"date\":\"2030-05-01\",\"is_recurring\":false},\"child_order\":1},
+{\"id\":\"t2\",\"content\":\"Sub\",\"description\":\"\",\"project_id\":\"p1\",\"section_id\":\"s1\",\"parent_id\":\"t1\",\"priority\":1,\"labels\":[],\"checked\":false,\"is_deleted\":false,\"due\":null,\"child_order\":2}],
+\"notes\":[],\"collaborators\":[]}")
+
+(defmacro org-todoist--test-with-storage (&rest body)
+  "Run BODY with a fresh temporary todoist file and storage directory."
+  (declare (indent 0))
+  `(let* ((dir (make-temp-file "org-todoist-test" t))
+          (org-todoist-storage-dir dir)
+          (org-todoist-file (expand-file-name "todoist.org" dir))
+          (org-todoist--cached-ast nil)
+          (org-todoist--sync-lock nil)
+          (org-todoist--locked-buffer nil)
+          (org-todoist--sync-start-hash nil))
+     (unwind-protect (progn ,@body)
+       (when-let* ((buf (find-buffer-visiting org-todoist-file)))
+         (with-current-buffer buf (set-buffer-modified-p nil))
+         (kill-buffer buf))
+       (delete-directory dir t))))
+
+(ert-deftest org-todoist--test--parse-response-roundtrip ()
+  (org-todoist--test-with-storage
+    (let ((resp (json-read-from-string org-todoist--test-response)))
+      (should (org-todoist--parse-response resp (org-todoist--file-ast)))
+      (let* ((ast (org-todoist--file-ast))
+             (task (org-todoist--get-by-id org-todoist--task-type "t1" ast))
+             (sub (org-todoist--get-by-id org-todoist--task-type "t2" ast)))
+        (should (equal (org-element-property :raw-value task) "Buy milk"))
+        (should (equal (org-element-property :tags task) '("home")))
+        (should (equal (org-todoist--description-text task) "2 litres\n"))
+        (should (equal (org-todoist--get-task-id-position sub) "t1"))
+        (should (= (org-element-property :level sub) (1+ (org-element-property :level task)))))
+      (should (equal (org-todoist--get-sync-token) "tok2"))
+      ;; the file we wrote and the snapshot agree, so there is nothing to push
+      (should-not (org-todoist--push (org-todoist--file-ast)
+                                     (org-todoist--get-last-sync-buffer-ast))))))
+
+(ert-deftest org-todoist--test--parse-response-assigns-temp-ids ()
+  (org-todoist--test-with-storage
+    (org-todoist--parse-response (json-read-from-string org-todoist--test-response)
+                                 (org-todoist--file-ast))
+    ;; add a new task locally, push it, then deliver the temp id mapping
+    (with-current-buffer (find-file-noselect org-todoist-file)
+      (goto-char (point-max))
+      (insert "**** TODO Brand new\n")
+      (save-buffer))
+    (setq org-todoist--cached-ast nil)
+    (let* ((ast (org-todoist--file-ast))
+           (cmds (org-todoist--push ast (org-todoist--get-last-sync-buffer-ast)))
+           (add (--first (equal (assoc-default "type" it) "item_add") cmds))
+           (temp (assoc-default "uuid" add))
+           (tmp-id (assoc-default "temp_id" add)))
+      (should add)
+      (should tmp-id)
+      (ignore temp)
+      (org-todoist--parse-response
+       (json-read-from-string
+        (format "{\"sync_token\":\"tok3\",\"temp_id_mapping\":{\"%s\":\"real1\"},\"items\":[]}" tmp-id))
+       ast)
+      (let ((node (org-todoist--get-by-id org-todoist--task-type "real1" (org-todoist--file-ast))))
+        (should node)
+        (should (equal (org-element-property :raw-value node) "Brand new")))
+      (should (equal (org-todoist--get-sync-token) "tok3")))))
+
+(ert-deftest org-todoist--test--sync-token-has-no-newline ()
+  (org-todoist--test-with-storage
+    (org-todoist--set-sync-token "abc")
+    (should (equal (org-todoist--get-sync-token) "abc"))))
+
+(ert-deftest org-todoist--test--freeze-buffer ()
+  (org-todoist--test-with-storage
+    (with-temp-file org-todoist-file (insert "* P\n"))
+    (let ((buf (find-file-noselect org-todoist-file)))
+      (with-current-buffer buf
+        (org-todoist--freeze-buffer)
+        (should buffer-read-only)
+        (should-error (insert "x") :type 'buffer-read-only)
+        (org-todoist--unfreeze-buffer)
+        (should-not buffer-read-only)))))
+
+(ert-deftest org-todoist--test--release-lock-unfreezes ()
+  (org-todoist--test-with-storage
+    (with-temp-file org-todoist-file (insert "* P\n"))
+    (let ((buf (find-file-noselect org-todoist-file)))
+      (should (org-todoist--acquire-sync-lock))
+      (org-todoist--freeze-buffer)
+      (should (buffer-local-value 'buffer-read-only buf))
+      (org-todoist--release-sync-lock)
+      (should-not (buffer-local-value 'buffer-read-only buf))
+      (should (org-todoist--acquire-sync-lock)))))
+
+(ert-deftest org-todoist--test--backup-if-edited ()
+  (org-todoist--test-with-storage
+    (with-temp-file org-todoist-file (insert "* P\n"))
+    (let ((buf (find-file-noselect org-todoist-file)))
+      (setq org-todoist--sync-start-hash (org-todoist--buffer-hash))
+      (should-not (org-todoist--backup-if-edited))
+      (with-current-buffer buf (goto-char (point-max)) (insert "* typed during sync\n"))
+      (should (org-todoist--backup-if-edited))
+      (should (string-match-p "typed during sync"
+                              (with-temp-buffer
+                                (insert-file-contents (org-todoist--storage-file "pre-sync-backup.org"))
+                                (buffer-string)))))))
+
+(ert-deftest org-todoist--test--set-labels-from-response-removes-stale ()
+  (org-todoist--test-with-storage
+    (let ((resp (json-read-from-string org-todoist--test-response)))
+      (org-todoist--parse-response resp (org-todoist--file-ast))
+      (let* ((resp2 (json-read-from-string
+                     "{\"sync_token\":\"tok4\",\"items\":[{\"id\":\"t1\",\"content\":\"Buy milk\",\"description\":\"2 litres\",\"project_id\":\"p1\",\"section_id\":\"s1\",\"parent_id\":null,\"priority\":4,\"labels\":[\"work\"],\"checked\":false,\"is_deleted\":false,\"due\":null}]}"))
+             (ast (org-todoist--file-ast)))
+        (org-todoist--parse-response resp2 ast)
+        (should (equal (org-element-property :tags (org-todoist--get-by-id org-todoist--task-type "t1" ast))
+                       '("work")))))))
+
+(ert-deftest org-todoist--test--push-adds-before-updates ()
+  (let* ((old (org-todoist--test-tree (cons "s1" (org-todoist--test-task-org "t1" "Task"))))
+         (new (org-todoist--test-tree
+               (cons "s1" (concat (org-todoist--test-task-org "t1" "Task renamed")
+                                  "**** TODO Added after\n"))))
+         (types (mapcar #'car (org-todoist--test-push new old))))
+    (should (equal types '("item_add" "item_update")))))

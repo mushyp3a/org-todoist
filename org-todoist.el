@@ -42,6 +42,7 @@
 (require 'json)
 (require 'outline)
 (require 'xdg)
+(require 'iso8601)
 
                                         ;Configuration Variables;;;;;;;;;;;;;;;
 (defgroup org-todoist nil
@@ -926,17 +927,63 @@ Optional argument SYNC-REQUEST forces a synchronous call."
 (defconst org-todoist--sync-lock-timeout 120
   "Seconds after which a held sync lock is considered stale.")
 
+(defvar org-todoist--locked-buffer nil
+  "Cons of (BUFFER . WAS-READ-ONLY) for the Todoist buffer frozen during a sync.")
+
+(defvar org-todoist--sync-start-hash nil
+  "Hash of the Todoist file's contents when the in-flight sync was started.")
+
+(defun org-todoist--buffer-hash ()
+  "Hash the current contents of the Todoist file (buffer if visited, else disk)."
+  (if-let* ((buf (find-buffer-visiting (org-todoist-file))))
+      (with-current-buffer buf (secure-hash 'md5 buf))
+    (when (file-exists-p (org-todoist-file))
+      (with-temp-buffer
+        (insert-file-contents (org-todoist-file))
+        (secure-hash 'md5 (current-buffer))))))
+
+(defun org-todoist--freeze-buffer ()
+  "Make the visited Todoist buffer read-only so edits can't be lost mid-sync."
+  (setq org-todoist--sync-start-hash (org-todoist--buffer-hash))
+  (when-let* ((buf (find-buffer-visiting (org-todoist-file))))
+    (with-current-buffer buf
+      (setq org-todoist--locked-buffer (cons buf buffer-read-only)
+            buffer-read-only t))))
+
+(defun org-todoist--unfreeze-buffer ()
+  "Restore the read-only state saved by `org-todoist--freeze-buffer'."
+  (when-let* ((locked org-todoist--locked-buffer))
+    (when (buffer-live-p (car locked))
+      (with-current-buffer (car locked)
+        (setq buffer-read-only (cdr locked))))
+    (setq org-todoist--locked-buffer nil)))
+
+(defun org-todoist--backup-if-edited ()
+  "Save a copy of the Todoist file if it changed since the sync started.
+Returns non-nil if a backup was written."
+  (when (and org-todoist--sync-start-hash
+             (not (equal org-todoist--sync-start-hash (org-todoist--buffer-hash))))
+    (let ((backup (org-todoist--storage-file "pre-sync-backup.org")))
+      (if-let* ((buf (find-buffer-visiting (org-todoist-file))))
+          (with-current-buffer buf (write-region nil nil backup nil 'silent))
+        (copy-file (org-todoist-file) backup t))
+      (message "Todoist file was edited during the sync; previous contents saved to %s" backup)
+      t)))
+
 (defun org-todoist--acquire-sync-lock ()
   "Take the sync lock.  Return nil if another sync is in flight."
   (if (and org-todoist--sync-lock
            (< (- (float-time) org-todoist--sync-lock) org-todoist--sync-lock-timeout))
       nil
+    (org-todoist--unfreeze-buffer)
     (setq org-todoist--sync-lock (float-time))
     t))
 
 (defun org-todoist--release-sync-lock ()
-  "Release the sync lock."
-  (setq org-todoist--sync-lock nil))
+  "Release the sync lock and unfreeze the Todoist buffer."
+  (org-todoist--unfreeze-buffer)
+  (setq org-todoist--sync-start-hash nil
+        org-todoist--sync-lock nil))
 
 (defun org-todoist--api-call (request-data callback-fn &optional callback-args sync-request)
   "Make an API call to Todoist sync endpoint.
@@ -993,6 +1040,7 @@ TOKEN and OPEN are as in `org-todoist--do-sync'."
          (request-data `(("sync_token" . ,TOKEN)
                          ("resource_types" . ,(json-encode org-todoist-resource-types))
                          ("commands" . ,commands))))
+    (org-todoist--freeze-buffer)
     (message (if OPEN "Syncing with todoist. Buffer will open when sync is complete..." "Syncing with todoist. This may take a moment..."))
     (if (equal TOKEN "*")
         ;; For full resets, don't batch - just send one request
@@ -1524,9 +1572,38 @@ EFF is the effort number in minutes."
         `(("amount" . ,(round (/ sec-diff 60))) ("unit" . "minute")))
     (when eff `(("amount" . ,(round eff)) ("unit" . "minute")))))
 
+(defun org-todoist--blank-id-p (ID)
+  "Non-nil if ID is nil or the empty string."
+  (or (null ID) (equal ID "")))
+
+(defun org-todoist--item-move-args (PARENT SECTION PROJECT OLD-PARENT OLD-SECTION OLD-PROJECT)
+  "Return the single (KEY . ID) pair an item_move needs, or nil for no move.
+
+PARENT, SECTION and PROJECT are the ids the task is now under; the OLD-*
+arguments are the ids it was under at the last sync.  A blank SECTION means
+the project's default (unsectioned) section."
+  (let ((blank #'org-todoist--blank-id-p))
+    (cond
+     ;; Subtask: only a change of parent task matters. Section and project follow the parent.
+     ((not (funcall blank PARENT))
+      (unless (equal PARENT OLD-PARENT)
+        `("parent_id" . ,PARENT)))
+     ;; Top-level task in a section, which changed (or was promoted from a subtask).
+     ((not (funcall blank SECTION))
+      (when (or (not (equal SECTION OLD-SECTION))
+                (not (funcall blank OLD-PARENT)))
+        `("section_id" . ,SECTION)))
+     ;; Top-level task in the default section.
+     ((or (not (funcall blank OLD-PARENT))
+          (not (funcall blank OLD-SECTION))
+          (not (equal PROJECT OLD-PROJECT)))
+      `("project_id" . ,PROJECT)))))
+
 (defun org-todoist--push (ast old)
   "Create commands necessary to transform syntax tree from OLD to AST."
-  (let ((commands nil))
+  (let ((commands nil)
+        (new-index nil)
+        (old-index (org-todoist--build-id-index old)))
     (org-todoist--label-default-sections ast)
     (org-element-map ast 'headline
       (lambda (hl)
@@ -1555,7 +1632,7 @@ EFF is the effort number in minutes."
                (comments (org-todoist--get-comments-text hl))
                ;; (lr (org-element-property :LAST_REPEAT hl))
                ;; (last-repeat (when (and lr is-recurring) (org-timestamp-from-string lr)))
-               (oldtask (org-todoist--get-by-id nil id old))
+               (oldtask (org-todoist--index-lookup old-index nil id))
                (oldsection (org-todoist--get-section-id-position-non-default oldtask))
                (oldparenttask (org-todoist--get-task-id-position oldtask))
                (oldproj (org-todoist--get-project-id-position oldtask))
@@ -1586,11 +1663,11 @@ EFF is the effort number in minutes."
                          ;; item_add. No ID -> new item
                          (org-todoist--insert-identifier hl org-todoist--task-type)
                          ;; HACK the current 07/25 Todoist API does not correctly add dates in item_add requests
-                         (let ((req `(("type" . "item_update")
-                                      ("uuid" . ,(org-id-uuid))
-                                      ("args" . (("id" . ,id)
-                                                 ("due" . ,(org-todoist--todoist-date-object-for-kw hl :scheduled)))))))
-                           (push req commands))
+                         (when-let* ((due (org-todoist--todoist-date-object-for-kw hl :scheduled)))
+                           (push `(("type" . "item_update")
+                                   ("uuid" . ,(org-id-uuid))
+                                   ("args" . (("id" . ,id) ("due" . ,due))))
+                                 commands))
                          (push `(("uuid" . ,(org-id-uuid))
                                  ("temp_id" . ,id)
                                  ("type" . "item_add")
@@ -1613,51 +1690,24 @@ EFF is the effort number in minutes."
                              (push (org-todoist--get-note-add id comment) commands))))
 
                      ;; when is somewhat redundant, as oldtask should not be null if there is a tid (new item)
-                     (when oldtask
-                       (unless (equal comments oldcomments)
+                     ;; A task with an id that is missing from an existing snapshot (e.g. copied in
+                     ;; from another file) gets a full item_update. With no snapshot at all, skip:
+                     ;; pushing a possibly stale file would overwrite remote data.
+                     (when (or oldtask old)
+                       (when (and oldtask (not (equal comments oldcomments)))
                          ;; TODO support comment editing. This will push any edited comments as new comments
                          (dolist (comment (--filter (not (member it oldcomments)) comments))
                            (push (org-todoist--get-note-add id comment) commands)))
 
-                       ;; item_move. Only one parameter can be specified
-                       (unless (and (string= section oldsection)
-                                    (string= proj oldproj)
-                                    (string= parenttask oldparenttask))
-                         (cond ((and parenttask (not (string= parenttask oldparenttask)))
-                                ;; item_move - parent task
-                                (push `(("uuid" . ,(org-id-uuid))
-                                        ("type" . "item_move")
-                                        ("args" . (("id" . ,id)
-                                                   ("parent_id" . ,parenttask))))
-                                      commands))
-
-                               ;; special case: move to unsectioned in another project
-                               ((and (or (null section) (string= "" section))
-                                     (not (string= proj oldproj)))
-                                (unless parenttask
-                                  (push `(("uuid" . ,(org-id-uuid))
-                                          ("type" . "item_move")
-                                          ("args" . (("id" . ,id)
-                                                     ("project_id" . ,proj))))
-                                        commands)))
-
-                               ;; move to another section (may be another project)
-                               ((not (string= section oldsection))
-                                ;; item_move - section
-                                (push `(("uuid" . ,(org-id-uuid))
-                                        ("type" . "item_move")
-                                        ("args" . (("id" . ,id)
-                                                   ("section_id" . ,section))))
-                                      commands))
-
-                               ((not (string= proj oldproj))
-                                (unless (string= section oldsection) ; whole section moved, ignore
-                                  ;;item_move - project
-                                  (push `(("uuid" . ,(org-id-uuid))
-                                          ("type" . "item_move")
-                                          ("args" . (("id" . ,id)
-                                                     ("project_id" . ,proj))))
-                                        commands)))))
+                       ;; item_move. Only one of parent_id, section_id or project_id may be sent.
+                       (when-let* ((oldtask)
+                                   (move (org-todoist--item-move-args
+                                          parenttask section proj
+                                          oldparenttask oldsection oldproj)))
+                         (push `(("uuid" . ,(org-id-uuid))
+                                 ("type" . "item_move")
+                                 ("args" . (("id" . ,id) ,move)))
+                               commands))
 
                        ;; item_update
                        (when (or
@@ -1704,7 +1754,7 @@ EFF is the effort number in minutes."
                                  commands)))
 
                        ;; todo-state changed
-                       (when (not (equal todo-type old-todo-type))
+                       (when (and oldtask (not (equal todo-type old-todo-type)))
                          (if (eq 'done todo-type)
                              (if (string= org-todoist-deleted-keyword todo-kw)
                                  (push `(("uuid" . ,(org-id-uuid))
@@ -1719,8 +1769,8 @@ EFF is the effort number in minutes."
                                  (push `(("uuid" . ,(org-id-uuid))
                                          ("type" . "item_complete")
                                          ("args" . (,(org-todoist--id-arg id "item_complete")
-                                                    ("date_completed" .
-                                                     ,(org-todoist--timestamp-to-utc-str (org-element-property :closed hl))))))
+                                                    ,@(when-let* ((closed (org-element-property :closed hl)))
+                                                        `(("date_completed" . ,(org-todoist--timestamp-to-utc-str closed)))))))
                                        commands)))
                            (push `(("uuid" . ,(org-id-uuid))
                                    ("type" . "item_uncomplete")
@@ -1809,6 +1859,7 @@ EFF is the effort number in minutes."
                                           ("parent_id" . ,proj))))
                              commands)))))))))
     (when org-todoist-delete-remote-items
+      (setq new-index (org-todoist--build-id-index ast))
       (org-element-map
           old
           'headline
@@ -1817,7 +1868,7 @@ EFF is the effort number in minutes."
             (let ((id (org-todoist--get-prop hl org-todoist--id-property))
                   (type (org-todoist--get-todoist-type hl)))
               (when id
-                (let ((new (org-todoist--get-by-id type id ast)))
+                (let ((new (org-todoist--index-lookup new-index type id)))
                   (unless new
                     ;; item was deleted (or archived to another file...)
                     (cond
@@ -1874,6 +1925,7 @@ EFF is the effort number in minutes."
         (comments (assoc-default 'notes RESPONSE))
         (token (assoc-default 'sync_token RESPONSE))
         (tid_mapping (assoc-default 'temp_id_mapping RESPONSE)))
+    (org-todoist--backup-if-edited)
     (org-todoist--temp-id-mapping tid_mapping AST)
     (org-todoist--update-users collab AST)
     (org-todoist--update-projects projects AST)
@@ -1883,6 +1935,8 @@ EFF is the effort number in minutes."
     ;; Persist the token last: if anything above or below fails, the next sync
     ;; re-fetches these changes instead of losing them.
     (prog1 (org-todoist--update-file AST)
+      (when org-todoist--sync-start-hash ; later batches compare against our own write
+        (setq org-todoist--sync-start-hash (org-todoist--buffer-hash)))
       (org-todoist--set-last-sync-buffer AST)
       (when token (org-todoist--set-sync-token token)))))
 
@@ -2020,9 +2074,9 @@ EFF is the effort number in minutes."
                        ;; Section is under the right project, add props only
                        (org-todoist--add-all-properties section sect org-todoist--section-skip-list)
                      ;; Move to the correct project
-                     (org-element-adopt
-                         (org-todoist--get-by-id org-todoist--project-type targetprojid AST)
-                       (org-element-extract section))))
+                     (org-todoist--adopt-sub
+                      (org-todoist--get-by-id org-todoist--project-type targetprojid AST)
+                      section)))
                ;; Otherwise make the section if parent project exists
                (when-let ((project (org-todoist--get-by-id org-todoist--project-type targetprojid AST)))
                  (org-todoist--get-or-create-node
@@ -2183,16 +2237,21 @@ When INACTIVE, return an inactive timestamp."
 STRING is an RFC3339 datetime string. With arg WITH-TIME include the
 time-of-day portion in the timestamp. When INACTIVE, make the timestamp
 inactive."
-  (org-timestamp-from-string (concat (if INACTIVE "[" "<")
-                                     (ts-format
-                                      (if WITH-TIME "%Y-%m-%d %a %H:%M" "%Y-%m-%d %a")
-                                      (ts-adjust 'second (car (current-time-zone)) (ts-parse-org-element (org-timestamp-from-time (org-read-date nil t STRING nil) WITH-TIME))))
-                                     (if INACTIVE "]" ">"))))
+  ;; Convert via the actual instant so the local UTC offset (incl. DST) is the one in force
+  ;; on that date, not today's.
+  (let ((time (if WITH-TIME
+                  (encode-time (iso8601-parse STRING))
+                (date-to-time (concat (substring STRING 0 10) " 00:00:00")))))
+    (org-timestamp-from-string (concat (if INACTIVE "[" "<")
+                                       (format-time-string
+                                        (if WITH-TIME "%Y-%m-%d %a %H:%M" "%Y-%m-%d %a")
+                                        time)
+                                       (if INACTIVE "]" ">")))))
 
 (defun org-todoist--timestamp-to-utc-str (TIMESTAMP)
   "Convert org TIMESTAMP element to a UTC RFC3339 string."
-  (ts-format "%Y-%m-%dT%H:%M:%S.0Z"
-             (ts-adjust 'second (- (car (current-time-zone))) (ts-parse-org-element TIMESTAMP))))
+  (when TIMESTAMP
+    (format-time-string "%Y-%m-%dT%H:%M:%S.0Z" (org-timestamp-to-time TIMESTAMP) t)))
 
 (defun org-todoist--has-date (DATE)
   "If DATE is not nil, empty, or \"null\"."
@@ -2255,8 +2314,7 @@ inactive."
                              (and section
                                   (cl-equalp (org-todoist--get-section-id-position task)
                                              (org-todoist--id-or-temp-id section))))
-                   (org-element-extract task)
-                   (org-element-adopt section task))
+                   (org-todoist--adopt-sub section task))
 
                  (when tags
                    (org-todoist--set-labels task (append tags nil)))
@@ -2278,9 +2336,18 @@ inactive."
 ;; (dolist (parent with-child)
 ;;   (org-todoist--sort-by-child-order parent "child_order"))
 
+(defun org-todoist--relevel (NODE LEVEL)
+  "Set the :level of headline NODE to LEVEL, shifting its descendants too."
+  (let ((delta (- LEVEL (org-element-property :level NODE))))
+    (org-element-map NODE 'headline
+      (lambda (hl) (org-element-put-property hl :level (+ delta (org-element-property :level hl)))))
+    NODE))
+
 (defun org-todoist--adopt-sub (PARENT CHILD)
-  "Adopt CHILD under PARENT and increase the :level to parent + 1."
-  (org-element-adopt PARENT (org-element-put-property (org-element-extract CHILD) :level (+ 1 (org-element-property :level PARENT)))))
+  "Adopt CHILD under PARENT, releveling CHILD and its descendants beneath it."
+  (org-element-extract CHILD)
+  (org-todoist--relevel CHILD (+ 1 (or (org-element-property :level PARENT) 0)))
+  (org-element-adopt PARENT CHILD))
 
 (defun org-todoist--get-node-attributes (NODE)
   "Get the attributes list of NODE."
@@ -2492,6 +2559,26 @@ QUERY takes a single argument which is the current node."
                               (string= (org-todoist--get-prop hl org-todoist--id-property) ID))
                      hl))
       nil t)))
+
+(defun org-todoist--build-id-index (AST)
+  "Return a hash table of headline id -> headlines (document order) for AST."
+  (let ((index (make-hash-table :test 'equal)))
+    (when AST
+      (org-element-map AST 'headline
+        (lambda (hl)
+          (when-let* ((id (org-todoist--get-prop hl org-todoist--id-property)))
+            (puthash id (cons hl (gethash id index)) index)))))
+    (maphash (lambda (k v) (puthash k (nreverse v) index)) index)
+    index))
+
+(defun org-todoist--index-lookup (INDEX TYPE ID)
+  "Find the first headline with ID and TODOIST_TYPE TYPE in INDEX.
+Any type matches if TYPE is nil.
+INDEX comes from `org-todoist--build-id-index'."
+  (when ID
+    (--first (or (null TYPE)
+                 (string-equal (org-todoist--get-prop it org-todoist--type) TYPE))
+             (gethash ID INDEX))))
 
 (defun org-todoist--id-or-temp-id (NODE)
   "Get the `org-todoist--id-property' or \"temp_id\" property of NODE."

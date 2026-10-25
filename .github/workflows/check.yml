@@ -28,10 +28,15 @@ jobs:
           ignore_warnings: false
           check: package-lint
 
-      ## Disabled until either org-element-ast is upstreamed or I figure out how to properly pull it on the CI runner
-      # - name: Test
-      #   uses: leotaku/elisp-check@master
-      #   with:
-      #     check: ert
-      #     file: "test.el"
-      #     ignore_warnings: ${{ matrix.ignore_warnings }}
+      - name: Install dependencies
+        run: |
+          mkdir -p deps
+          git clone --depth 1 https://github.com/magnars/dash.el deps/dash.el
+          git clone --depth 1 https://github.com/magnars/s.el deps/s.el
+          git clone --depth 1 https://github.com/alphapapa/ts.el deps/ts.el
+
+      - name: Byte-compile
+        run: make compile DEPS=deps
+
+      - name: Test
+        run: make test DEPS=deps
