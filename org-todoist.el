@@ -1681,18 +1681,32 @@ EFF is the effort number in minutes."
                          ;;           ("type" . "item_close")
                          ;;           ("args" . (("id" . ,id))))
                          ;;         commands))
-                         (let ((req `(("type" . "item_update")
-                                      ("uuid" . ,(org-id-uuid))
-                                      ("args" . (("id" . ,id)
-                                                 ("content" . ,title)
-                                                 ("description" . ,(when desc desc))
-                                                 ("duration" . ,(org-todoist--get-duration hl eff))
-                                                 ("due" . ,(org-todoist--todoist-date-object-for-kw hl :scheduled))
-                                                 ("deadline" . ,(org-todoist--todoist-date-object-for-kw hl :deadline))
-                                                 ("priority" . ,(org-todoist--get-priority hl))
-                                                 ("labels" . ,labels)
-                                                 ("responsible_uid" . ,rid))))))
-                           (push req commands)))
+                         ;; Only send the fields that changed locally so that unrelated
+                         ;; remote edits are not reverted.
+                         (let* ((sch-changed (not (string-equal (org-element-property :raw-value sch)
+                                                                (org-element-property :raw-value oldsch))))
+                                (args `(("id" . ,id))))
+                           (when (not (string-equal title oldtitle))
+                             (push `("content" . ,title) args))
+                           (when (not (equal desc olddesc))
+                             (push `("description" . ,(or desc "")) args))
+                           (when (or sch-changed (not (equal eff oldeff)))
+                             (push `("duration" . ,(org-todoist--get-duration hl eff)) args))
+                           (when sch-changed
+                             (push `("due" . ,(org-todoist--todoist-date-object-for-kw hl :scheduled)) args))
+                           (when (not (string-equal (org-element-property :raw-value dead)
+                                                    (org-element-property :raw-value olddead)))
+                             (push `("deadline" . ,(org-todoist--todoist-date-object-for-kw hl :deadline)) args))
+                           (when (not (equal pri oldpri))
+                             (push `("priority" . ,(org-todoist--get-priority hl)) args))
+                           (when (not (equal labels oldlabels))
+                             (push `("labels" . ,(or labels [])) args))
+                           (when (not (equal rid oldrid))
+                             (push `("responsible_uid" . ,rid) args))
+                           (push `(("type" . "item_update")
+                                   ("uuid" . ,(org-id-uuid))
+                                   ("args" . ,(nreverse args)))
+                                 commands)))
 
                        ;; todo-state changed
                        (when (not (equal todo-type old-todo-type))
@@ -2247,8 +2261,8 @@ inactive."
                    (org-element-extract task)
                    (org-element-adopt section task))
 
-                 (dotimes (i (length tags))
-                   (org-todoist--add-tag task (aref tags i)))
+                 (when tags
+                   (org-todoist--set-labels task (append tags nil)))
                  (org-todoist--schedule task data)
                  (org-todoist--set-effort task data)
                  (org-todoist--set-priority task (assoc-default 'priority data))
@@ -2372,10 +2386,16 @@ CHECKED and DELETED are from the Todoist API response."
 (defun org-todoist--add-tag (NODE TAG)
   "Add TAG to NODE."
   (let ((tags (org-element-property :tags NODE)))
-    (if (null tags)
-        (org-element-put-property NODE :tags `(,TAG))
-      (unless (member TAG tags)
-        (push TAG tags)))))
+    (unless (member TAG tags)
+      (org-element-put-property NODE :tags (append tags (list TAG))))))
+
+(defun org-todoist--set-labels (NODE LABELS)
+  "Make the Todoist labels of NODE match LABELS, a list of strings.
+Tags unrelated to Todoist labels, i.e. the archive tag, are kept."
+  (let ((keep (when (member org-archive-tag (org-element-property :tags NODE))
+                (list org-archive-tag))))
+    (org-element-put-property
+     NODE :tags (append (--remove (member it keep) (append LABELS nil)) keep))))
 
 (defun org-todoist--archive (NODE)
   "Archives NODE via the `org-archive-tag' tag."

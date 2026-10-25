@@ -647,3 +647,17 @@ paragraph
     ;; stale locks expire
     (setq org-todoist--sync-lock (- (float-time) 1000))
     (should (org-todoist--acquire-sync-lock))))
+
+;; Tags
+
+(ert-deftest org-todoist--test--add-tag ()
+  (let ((hl (org-element-create 'headline '(:title "x" :level 1 :tags ("a")))))
+    (org-todoist--add-tag hl "b")
+    (should (equal (org-element-property :tags hl) '("a" "b")))
+    (org-todoist--add-tag hl "b")
+    (should (equal (org-element-property :tags hl) '("a" "b")))))
+
+(ert-deftest org-todoist--test--set-labels ()
+  (let ((hl (org-element-create 'headline `(:title "x" :level 1 :tags ("old" ,org-archive-tag)))))
+    (org-todoist--set-labels hl '("new"))
+    (should (equal (org-element-property :tags hl) `("new" ,org-archive-tag)))))
