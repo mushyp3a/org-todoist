@@ -90,9 +90,30 @@ This value must fall between `org-priority-lowest' and `org-priority-highest'."
   "If non-nil, `org-todoist-reset' rebuilds the file purely from Todoist.
 Anything only stored locally (clocking, ignored sub-trees, unsynced edits and
 tasks Todoist no longer has) is dropped; the old file is saved to
-\"pre-reset-backup.org\" in `org-todoist-storage-dir' first.  If nil, the
+\"pre-reset-backup-DATE.org\" in `org-todoist-storage-dir' first.  If nil, the
 reset merges Todoist's state into the file as of the last sync instead."
   :type 'boolean
+  :group 'org-todoist)
+
+(defcustom org-todoist-request-timeout 60
+  "Seconds to wait for a Todoist request before giving up."
+  :type 'integer
+  :group 'org-todoist)
+
+(defcustom org-todoist-command-retries 2
+  "Times to re-send a command that Todoist rejected, across later syncs."
+  :type 'integer
+  :group 'org-todoist)
+
+(defcustom org-todoist-delete-confirm-threshold 5
+  "Ask before a sync deletes more than this many items on Todoist.
+Background syncs skip instead of asking.  Nil never asks."
+  :type '(choice (const :tag "Never ask" nil) integer)
+  :group 'org-todoist)
+
+(defcustom org-todoist-backups-to-keep 3
+  "How many timestamped backups of each kind to keep in the storage dir."
+  :type 'integer
   :group 'org-todoist)
 
 (defcustom org-todoist-delete-remote-items nil
@@ -860,17 +881,24 @@ the Todoist project, section, and optionally parent task."
     (when (string= (org-element-property :raw-value section) org-todoist--default-section-name)
       (org-todoist--insert-id section org-todoist--default-id))))
 
+(defun org-todoist--curl-command (encoded-data)
+  "The curl command line that posts ENCODED-DATA to the sync endpoint."
+  `("curl" "-s"
+    "--max-time" ,(number-to-string org-todoist-request-timeout)
+    "--connect-timeout" "10"
+    "-X" ,org-todoist-http-method
+    "-H" ,(concat "Authorization: Bearer " org-todoist-api-token)
+    "-H" ,(concat "Content-Type: " org-todoist-request-type)
+    "-d" ,encoded-data
+    ,(org-todoist--sync-endpoint)))
+
 (defun org-todoist--api-call-curl (encoded-data callback-fn callback-args)
   "Make an API call using curl.
 Send request with ENCODED-DATA and then call apply on
 CALLBACK-FN with CALLBACK-ARGS."
   (let ((process-connection-type nil) ; Use a pipe
         (proc-buffer (generate-new-buffer " *org-todoist-curl*"))
-        (command `("curl" "-s" "-X" ,org-todoist-http-method
-                   "-H" ,(concat "Authorization: Bearer " org-todoist-api-token)
-                   "-H" ,(concat "Content-Type: " org-todoist-request-type)
-                   "-d" ,encoded-data
-                   ,(org-todoist--sync-endpoint))))
+        (command (org-todoist--curl-command encoded-data)))
     (set-process-sentinel
      (apply #'start-process "org-todoist-curl" proc-buffer command)
      (lambda (process _event)
@@ -904,7 +932,8 @@ Optional argument SYNC-REQUEST forces a synchronous call."
         (progn
           (message "Warning: Synchronous API call may block Emacs UI. Use C-g to abort if needed.")
           (condition-case err
-              (let ((response-buffer (url-retrieve-synchronously (org-todoist--sync-endpoint) 'silent 'inhibit-cookies)))
+              (let ((response-buffer (url-retrieve-synchronously (org-todoist--sync-endpoint) 'silent 'inhibit-cookies
+                                                                      org-todoist-request-timeout)))
                 (with-current-buffer response-buffer
                   (goto-char url-http-end-of-headers)
                   (let* ((resp-str (decode-coding-region (point) (point-max) 'utf-8 t))
@@ -914,27 +943,55 @@ Optional argument SYNC-REQUEST forces a synchronous call."
             (error
              (setq org-todoist--sync-err (format "url-retrieve-synchronously failed: %S" err))
              (apply callback-fn (cons nil callback-args)))))
-      (url-retrieve (org-todoist--sync-endpoint)
-                    (lambda (status)
-                      (if (plist-get status :error)
-                          (progn
-                            (setq org-todoist--sync-err (plist-get status :error))
-                            (apply callback-fn (cons nil callback-args))) ; Call with nil on error
-                        (with-current-buffer (current-buffer)
-                          (goto-char url-http-end-of-headers)
-                          (let* ((resp-str (decode-coding-region (point) (point-max) 'utf-8 t))
-                                 (response (json-read-from-string resp-str)))
-                            (org-todoist--set-last-response resp-str)
-                            (apply callback-fn (cons response callback-args))))))
-                    nil
-                    'silent
-                    'inhibit-cookies))))
+      (let* ((done nil)
+             (buf (url-retrieve
+                   (org-todoist--sync-endpoint)
+                   (lambda (status)
+                     (unless done
+                       (setq done t)
+                       (if (plist-get status :error)
+                           (progn
+                             (setq org-todoist--sync-err (plist-get status :error))
+                             (apply callback-fn (cons nil callback-args))) ; Call with nil on error
+                         (with-current-buffer (current-buffer)
+                           (goto-char url-http-end-of-headers)
+                           (let* ((resp-str (decode-coding-region (point) (point-max) 'utf-8 t))
+                                  (response (condition-case err
+                                                (json-read-from-string resp-str)
+                                              (error
+                                               (setq org-todoist--sync-err
+                                                     (format "Invalid JSON response (%S): %s" err resp-str))
+                                               nil))))
+                             (org-todoist--set-last-response resp-str)
+                             (apply callback-fn (cons response callback-args)))))))
+                   nil
+                   'silent
+                   'inhibit-cookies)))
+        (run-at-time org-todoist-request-timeout nil
+                     (lambda ()
+                       (unless done
+                         (setq done t
+                               org-todoist--sync-err
+                               (format "Request timed out after %ds" org-todoist-request-timeout))
+                         (when (buffer-live-p buf)
+                           (when-let* ((proc (get-buffer-process buf)))
+                             (delete-process proc))
+                           (kill-buffer buf))
+                         (apply callback-fn (cons nil callback-args)))))))))
+
+(defvar org-todoist--background-sync-p nil
+  "Non-nil while a sync is started by a timer, when nobody can be asked questions.")
 
 (defvar org-todoist--sync-lock nil
   "Time (as from `float-time') the current sync started, or nil when idle.")
 
-(defconst org-todoist--sync-lock-timeout 120
-  "Seconds after which a held sync lock is considered stale.")
+(defun org-todoist--sync-lock-timeout ()
+  "Seconds after which a held sync lock is considered stale.
+Longer than the request timeout, so a lock only goes stale if a sync died."
+  (* 2 org-todoist-request-timeout))
+
+(defvar org-todoist--sync-pending nil
+  "Non-nil if a sync was requested while another was in flight.")
 
 (defvar org-todoist--locked-buffer nil
   "Cons of (BUFFER . WAS-READ-ONLY) for the Todoist buffer frozen during a sync.")
@@ -973,22 +1030,36 @@ Returns non-nil if a backup was written."
   (when (and org-todoist--sync-start-hash
              (not (equal org-todoist--sync-start-hash (org-todoist--buffer-hash))))
     (message "Todoist file was edited during the sync; previous contents saved to %s"
-             (org-todoist--backup-file "pre-sync-backup.org"))
+             (org-todoist--backup-file "pre-sync-backup"))
     t))
 
-(defun org-todoist--backup-file (NAME)
-  "Save the current contents of the Todoist file as NAME in the storage dir.
-Returns the path of the backup."
-  (let ((backup (org-todoist--storage-file NAME)))
+(defun org-todoist--list-backups (PREFIX)
+  "List the backups named PREFIX-DATE.org in the storage dir, newest first."
+  (sort (directory-files org-todoist-storage-dir t
+                         (concat "\\`" (regexp-quote PREFIX) "-[0-9]+-[0-9]+\\.org\\'"))
+        #'string>))
+
+(defun org-todoist--prune-backups (PREFIX)
+  "Delete all but the newest `org-todoist-backups-to-keep' PREFIX backups."
+  (dolist (old (nthcdr org-todoist-backups-to-keep (org-todoist--list-backups PREFIX)))
+    (delete-file old)))
+
+(defun org-todoist--backup-file (PREFIX)
+  "Save the current contents of the Todoist file as a timestamped PREFIX backup.
+Only the newest `org-todoist-backups-to-keep' backups per PREFIX are kept.
+Returns the path of the new backup."
+  (let ((backup (org-todoist--storage-file
+                 (format "%s-%s.org" PREFIX (format-time-string "%Y%m%d-%H%M%S")))))
     (if-let* ((buf (find-buffer-visiting (org-todoist-file))))
         (with-current-buffer buf (write-region nil nil backup nil 'silent))
       (copy-file (org-todoist-file) backup t))
+    (org-todoist--prune-backups PREFIX)
     backup))
 
 (defun org-todoist--acquire-sync-lock ()
   "Take the sync lock.  Return nil if another sync is in flight."
   (if (and org-todoist--sync-lock
-           (< (- (float-time) org-todoist--sync-lock) org-todoist--sync-lock-timeout))
+           (< (- (float-time) org-todoist--sync-lock) (org-todoist--sync-lock-timeout)))
       nil
     (org-todoist--unfreeze-buffer)
     (setq org-todoist--sync-lock (float-time))
@@ -998,7 +1069,15 @@ Returns the path of the backup."
   "Release the sync lock and unfreeze the Todoist buffer."
   (org-todoist--unfreeze-buffer)
   (setq org-todoist--sync-start-hash nil
-        org-todoist--sync-lock nil))
+        org-todoist--sync-lock nil)
+  (when org-todoist--sync-pending
+    (setq org-todoist--sync-pending nil)
+    (run-at-time 0.5 nil #'org-todoist--run-pending-sync)))
+
+(defun org-todoist--run-pending-sync ()
+  "Run the sync that was requested while another one was in flight."
+  (let ((org-todoist--background-sync-p t))
+    (org-todoist-sync t)))
 
 (defun org-todoist--api-call (request-data callback-fn &optional callback-args sync-request)
   "Make an API call to Todoist sync endpoint.
@@ -1019,7 +1098,8 @@ Uses curl if available, otherwise falls back to `url-retrieve'."
   "Sync with Todoist servers in the background."
   (if (string= (buffer-file-name) (org-todoist-file))
       (message "Skipping background sync with Todoist servers since buffer is active...")
-    (org-todoist-sync t)))
+    (let ((org-todoist--background-sync-p t))
+      (org-todoist-sync t))))
 
 (defun org-todoist--do-sync (TOKEN OPEN &optional REPLACE)
   "Diff the Todoist org file, perform the API request, and update the file.
@@ -1032,7 +1112,8 @@ backing up the current file."
   (unless (org-todoist--is-current-api)
     (user-error "Org todoist has updated API versions! Run 'org-todoist-migrate-to-v1' to continue using org-todoist"))
   (if (not (org-todoist--acquire-sync-lock))
-      (message "A Todoist sync is already in progress; skipping.")
+      (progn (unless (equal TOKEN "*") (setq org-todoist--sync-pending t))
+             (message "A Todoist sync is already in progress; another will run when it finishes."))
     (org-todoist--do-sync-locked TOKEN OPEN REPLACE)))
 
 (defun org-todoist--do-sync-locked (TOKEN OPEN &optional REPLACE)
@@ -1051,19 +1132,104 @@ TOKEN, OPEN and REPLACE are as in `org-todoist--do-sync'."
     (org-mode)
     (org-element-parse-buffer)))
 
+(defconst org-todoist--retry-file "FAILED-COMMANDS.json"
+  "File in the storage dir holding commands Todoist rejected, to be re-sent.")
+
+(defvar org-todoist--command-attempts (make-hash-table :test 'equal)
+  "Map of command uuid to how many times it has been rejected so far.")
+
+(defvar org-todoist--sync-failures nil
+  "List of (ATTEMPTS . COMMAND) rejected by Todoist during the current sync.")
+
+(defun org-todoist--read-retry-queue ()
+  "Read the list of (ATTEMPTS . COMMAND) waiting to be re-sent."
+  (let ((file (org-todoist--storage-file org-todoist--retry-file)))
+    (when (file-exists-p file)
+      (condition-case nil
+          (with-temp-buffer
+            (insert-file-contents file)
+            (let ((json-object-type 'alist) (json-key-type 'string) (json-array-type 'list))
+              (mapcar (lambda (e) (cons (assoc-default "attempts" e) (assoc-default "command" e)))
+                      (json-read))))
+        (error nil)))))
+
+(defun org-todoist--write-retry-queue (ENTRIES)
+  "Store ENTRIES, a list of (ATTEMPTS . COMMAND), as the retry queue."
+  (let ((file (org-todoist--storage-file org-todoist--retry-file)))
+    (if (null ENTRIES)
+        (when (file-exists-p file) (delete-file file))
+      (with-temp-file file
+        (insert (json-encode
+                 (vconcat (mapcar (lambda (e) `(("attempts" . ,(car e)) ("command" . ,(cdr e))))
+                                  ENTRIES))))))))
+
+(defun org-todoist--take-queued-commands ()
+  "Return the queued commands, each given a fresh uuid, to send with this sync.
+The queue file is kept until the sync's response arrives."
+  (mapcar (lambda (e)
+            (let ((uuid (org-id-uuid))
+                  (cmd (cdr e)))
+              (puthash uuid (car e) org-todoist--command-attempts)
+              (cons (cons "uuid" uuid) (assoc-delete-all "uuid" (copy-sequence cmd)))))
+          (org-todoist--read-retry-queue)))
+
+(defun org-todoist--tree-contains-p (TREE STRINGS)
+  "Non-nil if any of STRINGS occurs anywhere inside TREE."
+  (cond ((stringp TREE) (member TREE STRINGS))
+        ((consp TREE) (or (org-todoist--tree-contains-p (car TREE) STRINGS)
+                          (org-todoist--tree-contains-p (cdr TREE) STRINGS)))
+        ((vectorp TREE) (seq-some (lambda (x) (org-todoist--tree-contains-p x STRINGS)) TREE))))
+
+(defun org-todoist--record-failures (RESPONSE COMMANDS)
+  "Queue the sent COMMANDS that Todoist rejected in RESPONSE, to retry later.
+Adds are retried by the normal diff, as are commands that depend on an add
+that failed, so only the rest are queued."
+  (let* ((mapped (mapcar (lambda (m) (format "%s" (car m)))
+                         (assoc-default 'temp_id_mapping RESPONSE)))
+         (unmapped (--remove (member it mapped)
+                             (delq nil (mapcar (lambda (c) (assoc-default "temp_id" c)) COMMANDS))))
+         (statuses (assoc-default 'sync_status RESPONSE)))
+    (dolist (cmd COMMANDS)
+      (let* ((uuid (assoc-default "uuid" cmd))
+             (status (cdr (assoc (intern (or uuid "")) statuses))))
+        (when (and status (not (equal status "ok"))
+                   (not (assoc "temp_id" cmd))
+                   (not (org-todoist--tree-contains-p cmd unmapped)))
+          (let ((attempts (1+ (gethash uuid org-todoist--command-attempts 0))))
+            (if (> attempts org-todoist-command-retries)
+                (message "Giving up on rejected Todoist command %s: %S"
+                         (assoc-default "type" cmd) status)
+              (push (cons attempts cmd) org-todoist--sync-failures))))))))
+
+(defun org-todoist--confirm-deletes (COMMANDS)
+  "Return non-nil if it's OK to send COMMANDS given how many items they delete."
+  (let ((n (cl-count-if (lambda (c) (member (assoc-default "type" c)
+                                            '("item_delete" "section_delete" "project_delete")))
+                        COMMANDS)))
+    (cond ((or (null org-todoist-delete-confirm-threshold)
+               (<= n org-todoist-delete-confirm-threshold))
+           t)
+          (org-todoist--background-sync-p nil)
+          (t (y-or-n-p (format "This sync will delete %d items on Todoist. Continue? " n))))))
+
 (defun org-todoist--do-sync-request (TOKEN OPEN &optional REPLACE)
   "Build and send the sync request.
 TOKEN, OPEN and REPLACE are as in `org-todoist--do-sync'."
   (when (and REPLACE (file-exists-p (org-todoist-file)))
-    (org-todoist--backup-file "pre-reset-backup.org"))
+    (org-todoist--backup-file "pre-reset-backup"))
+  (setq org-todoist--sync-failures nil)
+  (when REPLACE (org-todoist--write-retry-queue nil))
   (let* ((cur-marker (point-marker))
          (ast (if REPLACE (org-todoist--empty-ast) (org-todoist--file-ast)))
          (commands (if (equal TOKEN "*")
                        ;; For reset syncs, don't send any commands to preserve local changes
                        []
-                     ;; Normal sync - diff against last state
+                     ;; Normal sync - re-send rejected commands, then diff against last state
                      (let ((old (org-todoist--get-last-sync-buffer-ast)))
-                       (org-todoist--push ast old))))
+                       (append (org-todoist--take-queued-commands)
+                               (org-todoist--push ast old)))))
+         (_ (unless (org-todoist--confirm-deletes commands)
+              (user-error "Sync cancelled: too many deletions pending (see `org-todoist-delete-confirm-threshold')")))
          (request-data `(("sync_token" . ,TOKEN)
                          ("resource_types" . ,(json-encode org-todoist-resource-types))
                          ("commands" . ,commands))))
@@ -1099,9 +1265,10 @@ TOKEN, OPEN and REPLACE are as in `org-todoist--do-sync'."
           (cl-labels ((process-batch (batches-left sync-token temp-id-map)
                         (when batches-left
                           (let* ((current-batch (car batches-left))
+                                 (sent-batch (org-todoist--replace-temp-ids current-batch temp-id-map))
                                  (batch-request-data `(("sync_token" . ,sync-token)
                                                        ("resource_types" . ,(json-encode org-todoist-resource-types))
-                                                       ("commands" . ,(org-todoist--replace-temp-ids current-batch temp-id-map)))))
+                                                       ("commands" . ,sent-batch))))
                             (message "Sending batch %s" (length batches-left))
                             (org-todoist--api-call
                              batch-request-data
@@ -1113,7 +1280,7 @@ TOKEN, OPEN and REPLACE are as in `org-todoist--do-sync'."
                                        (new-temp-ids (assoc-default 'temp_id_mapping response))
                                        (ok nil))
                                    (unwind-protect
-                                       (setq ok (org-todoist--check-response response))
+                                       (setq ok (org-todoist--check-response response sent-batch))
                                      (unless ok (org-todoist--release-sync-lock)))
                                    (when ok
                                      (condition-case err
@@ -1124,7 +1291,8 @@ TOKEN, OPEN and REPLACE are as in `org-todoist--do-sync'."
                                       ((cdr batches-left)
                                        (message "Batch complete. %d remaining..." (length (cdr batches-left)))
                                        (process-batch (cdr batches-left) new-token (append temp-id-map new-temp-ids)))
-                                      (t (org-todoist--release-sync-lock)
+                                      (t (org-todoist--write-retry-queue (reverse org-todoist--sync-failures))
+                                         (org-todoist--release-sync-lock)
                                          (org-todoist--handle-display cur-marker)
                                          (message "Sync complete.")))))))
                              `(,OPEN ,ast ,cur-marker))))))
@@ -1144,10 +1312,11 @@ CUR-MARKER is the marker at point when the sync was invoked."
         (message "Sync complete."))
     (org-todoist--release-sync-lock)))
 
-(defun org-todoist--check-response (response)
+(defun org-todoist--check-response (response &optional commands)
   "Return non-nil if RESPONSE is a usable sync response.
 On failure set `org-todoist--sync-err' and return nil.  Also report any
-per-command failures listed in the response's `sync_status'."
+per-command failures listed in the response's `sync_status'; if COMMANDS,
+the commands that were sent, queue the retryable ones for the next sync."
   (cond
    ((null response) nil)
    ((or (not (listp response)) (assoc-default 'error response)
@@ -1163,7 +1332,8 @@ per-command failures listed in the response's `sync_status'."
           (push status failed)))
       (when failed
         (setq org-todoist--sync-err (format "Todoist rejected commands: %S" failed))
-        (message "Todoist rejected %d command(s); see org-todoist--sync-err." (length failed))))
+        (message "Todoist rejected %d command(s); see org-todoist--sync-err." (length failed))
+        (when commands (org-todoist--record-failures response commands))))
     t)))
 
 (defun org-todoist--get-todoist-buffer ()
@@ -3580,7 +3750,7 @@ NOTE this will irreversibly discard all data not stored in Todoist
 \(e.g., time tracking information and ignored sub-trees.\).
 
 By default (see `org-todoist-reset-replaces-file') the file is rebuilt
-entirely from Todoist and the old file is saved to \"pre-reset-backup.org\"
+entirely from Todoist and the old file is saved to \"pre-reset-backup-DATE.org\"
 in `org-todoist-storage-dir'.  Unsynced local changes are lost."
   (interactive "P")
   (if (and (not (eql 16 (car ARG)))

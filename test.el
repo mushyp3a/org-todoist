@@ -937,7 +937,7 @@ unsectioned tasks)."
       (should (org-todoist--backup-if-edited))
       (should (string-match-p "typed during sync"
                               (with-temp-buffer
-                                (insert-file-contents (org-todoist--storage-file "pre-sync-backup.org"))
+                                (insert-file-contents (car (org-todoist--list-backups "pre-sync-backup")))
                                 (buffer-string)))))))
 
 (ert-deftest org-todoist--test--set-labels-from-response-removes-stale ()
@@ -982,7 +982,7 @@ unsectioned tasks)."
         (org-todoist--do-reset t))
       (let ((new (org-todoist--test-file-string))
             (backup (with-temp-buffer
-                      (insert-file-contents (org-todoist--storage-file "pre-reset-backup.org"))
+                      (insert-file-contents (car (org-todoist--list-backups "pre-reset-backup")))
                       (buffer-string))))
         (should (string-match-p "Buy milk" new))
         (should (string-match-p "tid: *t2" new))
@@ -1010,4 +1010,161 @@ unsectioned tasks)."
                 ((symbol-function 'org-todoist--handle-display) #'ignore))
         (org-todoist--do-reset t))
       (should (string-match-p "Kept" (org-todoist--test-file-string)))
-      (should-not (file-exists-p (org-todoist--storage-file "pre-reset-backup.org"))))))
+      (should-not (org-todoist--list-backups "pre-reset-backup")))))
+
+;; retries, timeouts, delete confirmation, backups, pending syncs
+
+(defun org-todoist--test-sync-with-responder (responder)
+  "Run a normal sync where the API is stubbed by RESPONDER.
+RESPONDER is called with the list of commands sent and returns the response JSON string."
+  (cl-letf (((symbol-function 'org-todoist--api-call)
+             (lambda (data cb &optional args _sync)
+               (let ((cmds (assoc-default "commands" data)))
+                 (apply cb (cons (json-read-from-string (funcall responder cmds)) args)))))
+            ((symbol-function 'org-todoist--handle-display) #'ignore))
+    (let ((org-todoist-api-token "x"))
+      (org-todoist--do-sync (org-todoist--get-sync-token) nil))))
+
+(defun org-todoist--test-statuses (cmds status-fn)
+  "A sync_status JSON object for CMDS, with (funcall STATUS-FN cmd) giving each status."
+  (concat "{"
+          (mapconcat (lambda (c) (format "\"%s\":%s" (assoc-default "uuid" c) (funcall status-fn c)))
+                     cmds ",")
+          "}"))
+
+(defun org-todoist--test-initial-sync ()
+  "Populate the temp todoist file and snapshot from `org-todoist--test-response'."
+  (org-todoist--parse-response (json-read-from-string org-todoist--test-response)
+                               (org-todoist--file-ast)))
+
+(defun org-todoist--test-rename-t1 (title)
+  (with-current-buffer (find-file-noselect org-todoist-file)
+    (let ((inhibit-read-only t))
+      (goto-char (point-min))
+      (re-search-forward "Buy milk")
+      (replace-match title t t)
+      (save-buffer)))
+  (setq org-todoist--cached-ast nil))
+
+(ert-deftest org-todoist--test--rejected-command-is-retried ()
+  (org-todoist--test-with-storage
+    (org-todoist--test-initial-sync)
+    (org-todoist--test-rename-t1 "Buy oat milk")
+    ;; first sync: Todoist rejects the item_update
+    (org-todoist--test-sync-with-responder
+     (lambda (cmds)
+       (should (equal (mapcar (lambda (c) (assoc-default "type" c)) cmds) '("item_update")))
+       (format "{\"sync_token\":\"tok5\",\"sync_status\":%s}"
+               (org-todoist--test-statuses cmds (lambda (_) "{\"error\":\"nope\"}")))))
+    (should (= 1 (length (org-todoist--read-retry-queue))))
+    ;; second sync: nothing changed locally, but the rejected command is sent again
+    (let (second)
+      (org-todoist--test-sync-with-responder
+       (lambda (cmds)
+         (setq second cmds)
+         (format "{\"sync_token\":\"tok6\",\"sync_status\":%s}"
+                 (org-todoist--test-statuses cmds (lambda (_) "\"ok\"")))))
+      (should (= 1 (length second)))
+      (should (equal (assoc-default "content" (assoc-default "args" (car second))) "Buy oat milk")))
+    ;; and once it succeeds the queue is empty
+    (should-not (org-todoist--read-retry-queue))))
+
+(ert-deftest org-todoist--test--rejected-command-gives-up ()
+  (org-todoist--test-with-storage
+    (let ((org-todoist-command-retries 1))
+      (org-todoist--test-initial-sync)
+      (org-todoist--test-rename-t1 "Buy oat milk")
+      (dotimes (_ 3)
+        (org-todoist--test-sync-with-responder
+         (lambda (cmds)
+           (format "{\"sync_token\":\"tok7\",\"sync_status\":%s}"
+                   (org-todoist--test-statuses cmds (lambda (_) "{\"error\":\"nope\"}"))))))
+      ;; first try + 1 retry, then dropped
+      (should-not (org-todoist--read-retry-queue)))))
+
+(ert-deftest org-todoist--test--rejected-add-is-not-queued ()
+  (let ((org-todoist--sync-failures nil)
+        (cmds '((("uuid" . "u1") ("temp_id" . "tmp1") ("type" . "item_add") ("args" . (("content" . "x"))))
+                (("uuid" . "u2") ("type" . "item_update") ("args" . (("id" . "tmp1") ("due" . "z")))))))
+    (org-todoist--record-failures
+     (json-read-from-string "{\"sync_status\":{\"u1\":{\"error\":\"e\"},\"u2\":{\"error\":\"e\"}},\"temp_id_mapping\":{}}")
+     cmds)
+    (should-not org-todoist--sync-failures)))
+
+(ert-deftest org-todoist--test--curl-command-has-timeouts ()
+  (let ((org-todoist-request-timeout 42) (org-todoist-api-token "tok"))
+    (let ((cmd (org-todoist--curl-command "a=b")))
+      (should (equal (cadr (member "--max-time" cmd)) "42"))
+      (should (member "--connect-timeout" cmd))
+      (should (member "a=b" cmd))))
+  ;; a lock only goes stale after the request itself must have timed out
+  (let ((org-todoist-request-timeout 42))
+    (should (> (org-todoist--sync-lock-timeout) 42))))
+
+(ert-deftest org-todoist--test--confirm-deletes ()
+  (let ((many (cl-loop repeat 6 collect '(("type" . "item_delete"))))
+        (few (cl-loop repeat 5 collect '(("type" . "item_delete"))))
+        (org-todoist-delete-confirm-threshold 5)
+        (asked nil))
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (_) (setq asked t) t)))
+      (should (org-todoist--confirm-deletes few))
+      (should-not asked)
+      (should (org-todoist--confirm-deletes many))
+      (should asked))
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (_) nil)))
+      (should-not (org-todoist--confirm-deletes many)))
+    ;; background syncs never ask; they refuse
+    (let ((org-todoist--background-sync-p t))
+      (cl-letf (((symbol-function 'y-or-n-p) (lambda (_) (error "must not ask"))))
+        (should-not (org-todoist--confirm-deletes many))))
+    (let ((org-todoist-delete-confirm-threshold nil))
+      (should (org-todoist--confirm-deletes many)))))
+
+(ert-deftest org-todoist--test--sync-aborts-on-mass-delete ()
+  (org-todoist--test-with-storage
+    (org-todoist--test-initial-sync)
+    ;; local file loses everything
+    (with-current-buffer (find-file-noselect org-todoist-file)
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert "#+title: Todoist\n")
+        (save-buffer)))
+    (setq org-todoist--cached-ast nil)
+    (let ((org-todoist-delete-remote-items t)
+          (org-todoist-delete-confirm-threshold 0)
+          (org-todoist-api-token "x")
+          (sent nil))
+      (cl-letf (((symbol-function 'y-or-n-p) (lambda (_) nil))
+                ((symbol-function 'org-todoist--api-call) (lambda (&rest _) (setq sent t))))
+        (should-error (org-todoist--do-sync (org-todoist--get-sync-token) nil) :type 'user-error))
+      (should-not sent)
+      (should-not org-todoist--sync-lock))))
+
+(ert-deftest org-todoist--test--backups-are-pruned ()
+  (org-todoist--test-with-storage
+    (let ((org-todoist-backups-to-keep 3))
+      (dotimes (i 5)
+        (with-temp-file (org-todoist--storage-file (format "pre-reset-backup-20260101-00000%d.org" i))
+          (insert "x")))
+      (with-temp-file (org-todoist--storage-file "pre-sync-backup-20260101-000009.org") (insert "y"))
+      (org-todoist--prune-backups "pre-reset-backup")
+      (should (equal (mapcar #'file-name-nondirectory (org-todoist--list-backups "pre-reset-backup"))
+                     '("pre-reset-backup-20260101-000004.org"
+                       "pre-reset-backup-20260101-000003.org"
+                       "pre-reset-backup-20260101-000002.org")))
+      ;; other kinds are untouched
+      (should (= 1 (length (org-todoist--list-backups "pre-sync-backup")))))))
+
+(ert-deftest org-todoist--test--sync-requested-during-sync-runs-after ()
+  (org-todoist--test-with-storage
+    (let ((org-todoist--sync-pending nil)
+          (org-todoist-api-token "x")
+          (scheduled nil))
+      (should (org-todoist--acquire-sync-lock))
+      (org-todoist--do-sync "tok" nil)   ; refused, but remembered
+      (should org-todoist--sync-pending)
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (_time _repeat fn &rest _) (setq scheduled fn))))
+        (org-todoist--release-sync-lock))
+      (should (eq scheduled #'org-todoist--run-pending-sync))
+      (should-not org-todoist--sync-pending))))

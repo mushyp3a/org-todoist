@@ -24,10 +24,13 @@ Debug: `~/.cache/org-todoist/last-request.json`, `last-response.json`, `M-x org-
 ## Gotchas
 - `json-read` gives symbol keys; command alists use string keys. Mixing them silently fails (`assoc-default`, `eq`).
 - Request body encoding is hand-rolled.
-- The buffer is fully rewritten after each sync. It is made read-only while a sync is in flight (`org-todoist--freeze-buffer`); if it changed anyway the old contents are saved to `pre-sync-backup.org` in the storage dir.
+- The buffer is fully rewritten after each sync. It is made read-only while a sync is in flight (`org-todoist--freeze-buffer`); if it changed anyway the old contents are saved to `pre-sync-backup-DATE.org` in the storage dir.
 - A sync lock (`org-todoist--sync-lock`) prevents overlapping syncs; failures land in `org-todoist--sync-err`.
 - Persist order after a response is file -> snapshot -> token.
-- `org-todoist-reset` rebuilds the file from an empty AST + full sync (`org-todoist-reset-replaces-file`, default t) and saves the old file to `pre-reset-backup.org` in the storage dir. Nil restores the old merge behaviour.
+- `org-todoist-reset` rebuilds the file from an empty AST + full sync (`org-todoist-reset-replaces-file`, default t) and saves the old file to `pre-reset-backup-DATE.org` in the storage dir (last `org-todoist-backups-to-keep`=3 kept; same for `pre-sync-backup-DATE.org`). Nil restores the old merge behaviour.
+- Commands Todoist rejects (non-add ones) are queued in `FAILED-COMMANDS.json` and re-sent on the next syncs, up to `org-todoist-command-retries`. Rejected adds are retried by the normal diff.
+- Requests time out after `org-todoist-request-timeout` (60s); the sync lock goes stale after twice that. A sync requested while one is running is queued to run after it.
+- A sync that would delete more than `org-todoist-delete-confirm-threshold` (5) items asks first; timer syncs refuse instead.
 - `item_move` takes exactly one of parent_id/section_id/project_id: see `org-todoist--item-move-args`. Never send a null section_id.
 - Recurring tasks completed in Emacs: `org-todoist--item-close-hook` sends `item_close`; the sync then only pushes the new due date. Don't also emit `item_close` from the diff (it would advance the task twice).
 - Lookups in `org-todoist--push` use an id index (`org-todoist--build-id-index`); `org-todoist--get-by-id` is still an O(n) walk, used when parsing responses.
@@ -40,3 +43,12 @@ Debug: `~/.cache/org-todoist/last-request.json`, `last-response.json`, `M-x org-
 - `make compile` (warnings are errors), `make test` (override `DEPS=` for the location of dash.el/s.el/ts.el). All tests in `test.el` should pass.
 - Run checkdoc and package-lint before committing. Do not track `.elc` files.
 - Prefer a unit test with a stubbed transport for any sync change.
+
+## Real-API smoke test (do on a throwaway Todoist project; tests only use fake responses)
+1. New project > section > task > subtask in one edit, `org-todoist-sync` once: all four get `tid`s.
+2. Rename a task locally and change its priority in Todoist, sync: both survive.
+3. Complete a task in Emacs and another in Todoist, sync.
+4. Move a task between sections, promote a subtask, move a task to the default section.
+5. Title `C++ 50% #1` round-trips.
+6. Complete a recurring task (DONE in org): Todoist advances it once, not twice.
+7. `org-todoist-reset`: no duplicates, a `pre-reset-backup-*.org` appears.
