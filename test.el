@@ -619,3 +619,31 @@ paragraph
     (should (equal (org-todoist--batch-commands '(1 2 3 4)) '((1 2) (3 4))))
     (should (equal (org-todoist--batch-commands '(1 2 3)) '((1 2) (3))))
     (should (null (org-todoist--batch-commands nil)))))
+
+;; Encoding, response checking and the sync lock
+
+(ert-deftest org-todoist--test--encode-percent-encodes-values ()
+  (let ((out (org-todoist--encode '(("sync_token" . "a+b%c#d=e&f")))))
+    (should (equal out "sync_token=a%2Bb%25c%23d%3De%26f"))))
+
+(ert-deftest org-todoist--test--check-response ()
+  (let (org-todoist--sync-err)
+    (should-not (org-todoist--check-response nil))
+    (should-not (org-todoist--check-response '((error . "bad"))))
+    (should (string-match-p "bad" org-todoist--sync-err))
+    (should-not (org-todoist--check-response '((items . nil))))
+    (setq org-todoist--sync-err nil)
+    (should (org-todoist--check-response '((sync_token . "t") (sync_status . ((u1 . "ok"))))))
+    (should (null org-todoist--sync-err))
+    (should (org-todoist--check-response '((sync_token . "t") (sync_status . ((u1 . "ok") (u2 . ((error . "x"))))))))
+    (should (string-match-p "u2" org-todoist--sync-err))))
+
+(ert-deftest org-todoist--test--sync-lock ()
+  (let ((org-todoist--sync-lock nil))
+    (should (org-todoist--acquire-sync-lock))
+    (should-not (org-todoist--acquire-sync-lock))
+    (org-todoist--release-sync-lock)
+    (should (org-todoist--acquire-sync-lock))
+    ;; stale locks expire
+    (setq org-todoist--sync-lock (- (float-time) 1000))
+    (should (org-todoist--acquire-sync-lock))))

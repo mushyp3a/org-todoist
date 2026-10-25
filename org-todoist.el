@@ -553,9 +553,9 @@ Automatically widens the buffer to ensure all content is accessible."
        request-data
        (lambda (response)
          (if response
-             (progn (when-let ((token (assoc-default 'sync_token response)))
-                      (org-todoist--set-sync-token token))
-                    (org-todoist--set-last-response response))
+             ;; Don't store the returned sync_token: this request fetches no
+             ;; resources, so advancing the token would skip remote changes.
+             nil
            (message "item_close hook failed. See org-todoist--sync-err for details.")))))))
 
 (defun org-todoist--activate-mode ()
@@ -728,7 +728,7 @@ the Todoist project, section, and optionally parent task."
                    (goto-char (point-max))
                    (forward-line -1)
                    (thing-at-point 'line t))))
-        (if res res "*"))
+        (if (and res (not (string-blank-p res))) (string-trim res) "*"))
     "*"))
 
 (defun org-todoist--set-last-sync-buffer (AST)
@@ -831,14 +831,14 @@ the Todoist project, section, and optionally parent task."
    (lambda (data)
      (if (null (cdr data)) "[]"
        (concat (car data) "="
-               ;; Todoist API does not accept "&" within elements. It is only allowed
-               ;; for separating key-value pairs in the x-www-form-urlencoded body.
-               (string-replace "&" "%26"
-                               (if (listp (cdr data))
-                                   (json-encode (cdr data))
-	                         (if (stringp (cdr data))
-                                     (cdr data)
-                                   (prin1-to-string (cdr data))))))))
+               ;; Values must be percent-encoded: "&", "+", "%", "#" and "=" are all
+               ;; significant in an x-www-form-urlencoded body.
+               (url-hexify-string
+                (if (listp (cdr data))
+                    (json-encode (cdr data))
+                  (if (stringp (cdr data))
+                      (cdr data)
+                    (prin1-to-string (cdr data))))))))
    (-filter (lambda (item) (cdr item)) DATA)
    "&"))
 
@@ -874,7 +874,12 @@ CALLBACK-FN with CALLBACK-ARGS."
            (let ((exit-code (process-exit-status process)))
              (if (= exit-code 0)
                  (let* ((resp-body (buffer-string))
-                        (response (json-read-from-string resp-body)))
+                        (response (condition-case err
+                                      (json-read-from-string resp-body)
+                                    (error
+                                     (setq org-todoist--sync-err
+                                           (format "Invalid JSON response (%S): %s" err resp-body))
+                                     nil))))
                    (org-todoist--set-last-response resp-body)
                    (apply callback-fn (cons response callback-args)))
                (setq org-todoist--sync-err (format "curl exited with code %d: %s" exit-code (buffer-string)))
@@ -920,6 +925,24 @@ Optional argument SYNC-REQUEST forces a synchronous call."
                     'silent
                     'inhibit-cookies))))
 
+(defvar org-todoist--sync-lock nil
+  "Time (as from `float-time') the current sync started, or nil when idle.")
+
+(defconst org-todoist--sync-lock-timeout 120
+  "Seconds after which a held sync lock is considered stale.")
+
+(defun org-todoist--acquire-sync-lock ()
+  "Take the sync lock.  Return nil if another sync is in flight."
+  (if (and org-todoist--sync-lock
+           (< (- (float-time) org-todoist--sync-lock) org-todoist--sync-lock-timeout))
+      nil
+    (setq org-todoist--sync-lock (float-time))
+    t))
+
+(defun org-todoist--release-sync-lock ()
+  "Release the sync lock."
+  (setq org-todoist--sync-lock nil))
+
 (defun org-todoist--api-call (request-data callback-fn &optional callback-args sync-request)
   "Make an API call to Todoist sync endpoint.
 SYNC-REQUEST forces synchronous execution and blocks Emacs. Use sparingly.
@@ -949,7 +972,21 @@ OPEN determines whether the Todoist buffer should be opened after sync."
     (user-error "No org-todoist-api-token API token set"))
   (unless (org-todoist--is-current-api)
     (user-error "Org todoist has updated API versions! Run 'org-todoist-migrate-to-v1' to continue using org-todoist"))
+  (if (not (org-todoist--acquire-sync-lock))
+      (message "A Todoist sync is already in progress; skipping.")
+    (org-todoist--do-sync-locked TOKEN OPEN)))
+
+(defun org-todoist--do-sync-locked (TOKEN OPEN)
+  "Body of `org-todoist--do-sync' once the sync lock is held.
+TOKEN and OPEN are as in `org-todoist--do-sync'."
   (setq org-todoist--sync-err nil)
+  (condition-case err
+      (org-todoist--do-sync-request TOKEN OPEN)
+    (error (org-todoist--release-sync-lock)
+           (signal (car err) (cdr err)))))
+
+(defun org-todoist--do-sync-request (TOKEN OPEN)
+  "Build and send the sync request.  TOKEN and OPEN as in `org-todoist--do-sync'."
   (let* ((cur-marker (point-marker))
          (ast (org-todoist--file-ast))
          (commands (if (equal TOKEN "*")
@@ -969,6 +1006,7 @@ OPEN determines whether the Todoist buffer should be opened after sync."
          (lambda (response open ast cur-marker)
            (when (and (equal TOKEN "*")
                       (eq (assoc-default 'full_sync response) :json-false))
+             (org-todoist--release-sync-lock)
              (error (setq org-todoist--sync-err "Full sync failed - Todoist returned full_sync=false")))
            (if open
                (progn (org-todoist--do-sync-callback response ast cur-marker)
@@ -999,21 +1037,28 @@ OPEN determines whether the Todoist buffer should be opened after sync."
                              batch-request-data
                              (lambda (response _ ast _)
                                (if (null response)
-                                   (message "Batch failed. See org-todoist--sync-err for details.")
+                                   (progn (org-todoist--release-sync-lock)
+                                          (message "Batch failed. See org-todoist--sync-err for details."))
                                  (let ((new-token (assoc-default 'sync_token response))
-                                       (new-temp-ids (assoc-default 'temp_id_mapping response)))
-                                   (org-todoist--parse-response response ast)
-                                   (cond
-                                    ((null new-token)
-                                     (message "Batch response had no sync token; stopping."))
-                                    ((cdr batches-left)
-                                       (progn
-                                         (message "Batch complete. %d remaining..." (length (cdr batches-left)))
-                                         (process-batch (cdr batches-left) new-token (append temp-id-map new-temp-ids))))
-                                    (t (message "Sync complete."))))))
+                                       (new-temp-ids (assoc-default 'temp_id_mapping response))
+                                       (ok nil))
+                                   (unwind-protect
+                                       (setq ok (org-todoist--check-response response))
+                                     (unless ok (org-todoist--release-sync-lock)))
+                                   (when ok
+                                     (condition-case err
+                                         (org-todoist--parse-response response ast)
+                                       (error (org-todoist--release-sync-lock)
+                                              (signal (car err) (cdr err))))
+                                     (cond
+                                      ((cdr batches-left)
+                                       (message "Batch complete. %d remaining..." (length (cdr batches-left)))
+                                       (process-batch (cdr batches-left) new-token (append temp-id-map new-temp-ids)))
+                                      (t (org-todoist--release-sync-lock)
+                                         (org-todoist--handle-display cur-marker)
+                                         (message "Sync complete.")))))))
                              `(,OPEN ,ast ,cur-marker))))))
-            (process-batch batches TOKEN nil)
-            (org-todoist--handle-display cur-marker)))))))
+            (process-batch batches TOKEN nil)))))))
 
 (defun org-todoist--do-sync-callback (response ast cur-marker)
   "The callback to invoke after syncing with the Todoist API.
@@ -1021,11 +1066,35 @@ OPEN determines whether the Todoist buffer should be opened after sync."
 RESPONSE is the parsed JSON response from the API.
 AST is the current abstract syntax tree of the local Todoist buffer.
 CUR-MARKER is the marker at point when the sync was invoked."
-  (if (null response)
-      (message "Sync failed. See org-todoist--sync-err for details.")
-    (when (org-todoist--parse-response response ast)
-      (org-todoist--handle-display cur-marker))
-    (message "Sync complete.")))
+  (unwind-protect
+      (if (not (org-todoist--check-response response))
+          (message "Sync failed. See org-todoist--sync-err for details.")
+        (when (org-todoist--parse-response response ast)
+          (org-todoist--handle-display cur-marker))
+        (message "Sync complete."))
+    (org-todoist--release-sync-lock)))
+
+(defun org-todoist--check-response (response)
+  "Return non-nil if RESPONSE is a usable sync response.
+On failure set `org-todoist--sync-err' and return nil.  Also report any
+per-command failures listed in the response's `sync_status'."
+  (cond
+   ((null response) nil)
+   ((or (not (listp response)) (assoc-default 'error response)
+        (null (assoc-default 'sync_token response)))
+    (setq org-todoist--sync-err
+          (format "Todoist returned an error: %S"
+                  (or (assoc-default 'error response) response)))
+    nil)
+   (t
+    (let (failed)
+      (dolist (status (assoc-default 'sync_status response))
+        (unless (equal (cdr status) "ok")
+          (push status failed)))
+      (when failed
+        (setq org-todoist--sync-err (format "Todoist rejected commands: %S" failed))
+        (message "Todoist rejected %d command(s); see org-todoist--sync-err." (length failed))))
+    t)))
 
 (defun org-todoist--get-todoist-buffer ()
   "Gets the org-todoist buffer, preferring open buffers."
@@ -1802,9 +1871,11 @@ EFF is the effort number in minutes."
     (org-todoist--update-sections sections AST)
     (org-todoist--update-tasks tasks AST)
     (org-todoist--update-comments comments AST)
-    (org-todoist--set-sync-token token)
-    (org-todoist--set-last-sync-buffer AST)
-    (org-todoist--update-file AST)))
+    ;; Persist the token last: if anything above or below fails, the next sync
+    ;; re-fetches these changes instead of losing them.
+    (prog1 (org-todoist--update-file AST)
+      (org-todoist--set-last-sync-buffer AST)
+      (when token (org-todoist--set-sync-token token)))))
 
 (defun org-todoist--temp-id-mapping (TID_MAPPING AST)
   "Add ids to node with a temp_id in AST using TID_MAPPING."
