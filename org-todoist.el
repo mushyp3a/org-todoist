@@ -50,11 +50,6 @@
   :prefix "org-todoist-"
   :link '(url-link "https://github.com/Lillenne/org-todoist"))
 
-(defgroup org-todoist nil
-  "Settings for org-todoist."
-  :group 'org
-  :prefix "org-todoist-")
-
 (defcustom org-todoist-p1 ?A
   "The priority to map to Todoist P1.
 This value must fall between `org-priority-lowest' and `org-priority-highest'."
@@ -1907,9 +1902,11 @@ EFF is the effort number in minutes."
   (cl-loop for comment across COMMENTS do
            ;; TODO support comment IDs and add/update/delete
            (let* ((task (org-todoist--get-by-id org-todoist--task-type (assoc-default 'item_id comment) AST))
-                  (comments (org-todoist--get-comments-text task))
+                  (comments (when task (org-todoist--get-comments-text task)))
                   (text (assoc-default 'content comment)))
-             (unless (member text comments)
+             (unless (or (null task)
+                         (eq t (assoc-default 'is_deleted comment))
+                         (member text comments))
                (org-todoist--log-drawer-add-note task (assoc-default 'content comment) (assoc-default 'posted_at comment)))
              ;; TODO sort comments by time.
              )))
@@ -2188,7 +2185,7 @@ time-of-day portion in the timestamp. When INACTIVE, make the timestamp
 inactive."
   (org-timestamp-from-string (concat (if INACTIVE "[" "<")
                                      (ts-format
-                                      (if WITH-TIME "%Y-%m-%d %a %H:%M" "Y-%m-%d %a")
+                                      (if WITH-TIME "%Y-%m-%d %a %H:%M" "%Y-%m-%d %a")
                                       (ts-adjust 'second (car (current-time-zone)) (ts-parse-org-element (org-timestamp-from-time (org-read-date nil t STRING nil) WITH-TIME))))
                                      (if INACTIVE "]" ">"))))
 

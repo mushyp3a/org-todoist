@@ -24,11 +24,13 @@ Debug: `~/.cache/org-todoist/last-request.json`, `last-response.json`, `M-x org-
 ## Gotchas
 - `json-read` gives symbol keys; command alists use string keys. Mixing them silently fails (`assoc-default`, `eq`).
 - Request body encoding is hand-rolled.
-- The buffer is fully rewritten after each sync; there is no sync lock.
-- `sync_status` in responses is not yet checked.
+- The buffer is fully rewritten after each sync, so edits made while a sync is in flight can be overwritten (not yet fixed).
+- A sync lock (`org-todoist--sync-lock`) prevents overlapping syncs; failures land in `org-todoist--sync-err`.
+- Persist order after a response is file -> snapshot -> token.
 - Known bugs are tracked in the plan at `~/.claude/plans/analyse-the-project-make-deep-conway.md`.
 
 ## Conventions
 - Commit messages: short, lowercase, imperative (e.g. "fix parens issue on item_add").
+- `make compile` (warnings are errors), `make test` (override `DEPS=` for the location of dash.el/s.el/ts.el). 10 old tests in `test.el` fail on the baseline too (stale); don't treat them as regressions.
 - Run checkdoc and package-lint before committing. Do not track `.elc` files.
 - Prefer a unit test with a stubbed transport for any sync change.
