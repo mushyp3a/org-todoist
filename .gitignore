@@ -3,3 +3,6 @@ api-call-update.json
 api-call-update-2.json
 *.elc
 .aider*
+.claude/
+CLAUDE.md
+CLAUDE.local.md
