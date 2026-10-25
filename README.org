@@ -1,6 +1,13 @@
 #+title: Org Todoist
 #+OPTIONS: f:t
 
+* Fork notice
+this is my personal fork of [[https://github.com/lillenne/org-todoist][lillenne/org-todoist]]. all the real work is theirs, i'm just fixing the stuff that kept breaking for me.
+
+it's for my own use, so it's still under development, probably buggy, and i might break things or change stuff without warning. if you want something stable go use the original. use at your own risk, and maybe back up your todoist.org first.
+
+everything below is the original readme, so some of it might not match what this fork does any more.
+
 * What is it?
 An Emacs package for bidirectional incremental sync of [[https://orgmode.org/][Org Mode]] elements with [[https://todoist.com/][Todoist]] using org /exactly how you normally would in Emacs Org Mode/.
 
