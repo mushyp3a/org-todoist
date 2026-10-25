@@ -8,6 +8,13 @@ it's for my own use, so it's still under development, probably buggy, and i migh
 
 everything below is the original readme, so some of it might not match what this fork does any more.
 
+** if something goes wrong
+- =M-x org-todoist-show-pending= shows what the next sync will send without sending it. worth running if a sync looks weird.
+- before every sync that sends changes (and every reset) the file gets backed up to =~/.cache/org-todoist/= as =pre-push-backup-*.org= / =pre-reset-backup-*.org=. the last 3 of each are kept.
+- if syncs start failing, check =org-todoist--sync-err= (=C-h v=).
+- if the file is a mess: restore a backup into your todoist file, then run =org-todoist-reset= so it matches todoist again. don't just sync, it will try to push the difference.
+- deleted something in todoist by accident? todoist keeps a trash, check there first.
+
 * What is it?
 An Emacs package for bidirectional incremental sync of [[https://orgmode.org/][Org Mode]] elements with [[https://todoist.com/][Todoist]] using org /exactly how you normally would in Emacs Org Mode/.
 

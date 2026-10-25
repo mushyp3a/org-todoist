@@ -1135,6 +1135,7 @@ RESPONDER is called with the list of commands sent and returns the response JSON
           (org-todoist-api-token "x")
           (sent nil))
       (cl-letf (((symbol-function 'y-or-n-p) (lambda (_) nil))
+                ((symbol-function 'yes-or-no-p) (lambda (_) nil))
                 ((symbol-function 'org-todoist--api-call) (lambda (&rest _) (setq sent t))))
         (should-error (org-todoist--do-sync (org-todoist--get-sync-token) nil) :type 'user-error))
       (should-not sent)
@@ -1168,3 +1169,133 @@ RESPONDER is called with the list of commands sent and returns the response JSON
         (org-todoist--release-sync-lock))
       (should (eq scheduled #'org-todoist--run-pending-sync))
       (should-not org-todoist--sync-pending))))
+
+;; id index used while applying a response
+
+(defun org-todoist--test-all-headlines (ast)
+  (org-element-map ast 'headline #'identity))
+
+(ert-deftest org-todoist--test--indexed-lookup-matches-walk ()
+  (org-todoist--test-with-storage
+    (org-todoist--test-initial-sync)
+    ;; second response: new section+task, t1 moved under a new parent, t2 deleted
+    (let ((resp (json-read-from-string
+                 "{\"sync_token\":\"tok9\",\"temp_id_mapping\":{},
+\"sections\":[{\"id\":\"s2\",\"name\":\"Other\",\"project_id\":\"p1\",\"is_deleted\":false,\"is_archived\":false,\"section_order\":2}],
+\"items\":[{\"id\":\"t3\",\"content\":\"New\",\"description\":\"\",\"project_id\":\"p1\",\"section_id\":\"s2\",\"parent_id\":null,\"priority\":1,\"labels\":[],\"checked\":false,\"is_deleted\":false,\"due\":null,\"child_order\":1},
+{\"id\":\"t1\",\"content\":\"Buy milk\",\"description\":\"2 litres\",\"project_id\":\"p1\",\"section_id\":\"s2\",\"parent_id\":\"t3\",\"priority\":4,\"labels\":[],\"checked\":false,\"is_deleted\":false,\"due\":null,\"child_order\":1},
+{\"id\":\"t2\",\"content\":\"Sub\",\"description\":\"\",\"project_id\":\"p1\",\"section_id\":\"s1\",\"parent_id\":\"t1\",\"priority\":1,\"labels\":[],\"checked\":false,\"is_deleted\":true,\"due\":null,\"child_order\":2}],
+\"notes\":[],\"collaborators\":[]}"))
+          (ast (org-todoist--file-ast)))
+      (org-todoist--parse-response resp ast)
+      (let* ((ast (org-todoist--file-ast))
+             (index (org-todoist--build-id-index ast))
+             (proj (org-todoist--get-by-id org-todoist--project-type "p1" ast)))
+        (should proj)
+        (dolist (scope (list ast proj))
+          (dolist (hl (org-todoist--test-all-headlines ast))
+            (let ((id (org-todoist--get-prop hl org-todoist--id-property)))
+              (dolist (type (list nil org-todoist--task-type org-todoist--section-type org-todoist--project-type))
+                (should (eq (org-todoist--get-by-id type id scope)
+                            (let ((org-todoist--id-index index))
+                              (org-todoist--get-by-id type id scope))))))))
+        ;; t1 now lives under t3
+        (should (equal (org-todoist--get-task-id-position
+                        (org-todoist--get-by-id org-todoist--task-type "t1" ast))
+                       "t3"))))))
+
+(ert-deftest org-todoist--test--index-skips-detached-and-registers-new-ids ()
+  (let* ((ast (org-todoist--generate-ast "* P\n** S\n*** T\n"))
+         (task (org-element-map ast 'headline
+                 (lambda (h) (when (equal (org-element-property :raw-value h) "T") h)) nil t)))
+    (org-todoist--add-prop task org-todoist--id-property "x1")
+    (org-todoist--insert-identifier task org-todoist--task-type)
+    (org-todoist--with-id-index ast
+      (should (eq task (org-todoist--get-by-id org-todoist--task-type "x1" ast)))
+      ;; ids assigned while the index is bound are picked up
+      (org-todoist--add-prop task org-todoist--id-property "x2")
+      (should (eq task (org-todoist--get-by-id org-todoist--task-type "x2" ast)))
+      ;; stale ids don't match
+      (should-not (org-todoist--get-by-id org-todoist--task-type "x1" ast))
+      ;; a node removed from the tree is not found
+      (org-element-extract task)
+      (should-not (org-todoist--get-by-id org-todoist--task-type "x2" ast)))))
+
+(ert-deftest org-todoist--test--indexed-lookup-does-not-walk-the-tree ()
+  (let* ((ast (org-todoist--generate-sample-ast))
+         (index (org-todoist--build-id-index ast))
+         (org-todoist--id-index index))
+    (cl-letf* ((orig (symbol-function 'org-element-map))
+               ((symbol-function 'org-element-map)
+                (lambda (data types &rest args)
+                  (when (eq types 'headline) (error "walked the tree"))
+                  (apply orig data types args))))
+      (should (org-todoist--get-by-id org-todoist--task-type "T2aBCdeF" ast))
+      (should-not (org-todoist--get-by-id org-todoist--task-type "nope" ast)))))
+
+;; extra safety nets
+
+(ert-deftest org-todoist--test--mass-delete-needs-a-typed-yes ()
+  (let ((many (cl-loop repeat 6 collect '(("type" . "item_delete"))))
+        (org-todoist-delete-confirm-threshold 3)
+        (asked-yes nil))
+    ;; 6 of 8 known items is more than half: yes-or-no-p, not y-or-n-p
+    (cl-letf (((symbol-function 'yes-or-no-p) (lambda (_) (setq asked-yes t) t))
+              ((symbol-function 'y-or-n-p) (lambda (_) (error "too casual"))))
+      (should (org-todoist--confirm-deletes many 8))
+      (should asked-yes))
+    (cl-letf (((symbol-function 'yes-or-no-p) (lambda (_) nil)))
+      (should-not (org-todoist--confirm-deletes many 8)))
+    ;; background syncs refuse without asking
+    (let ((org-todoist--background-sync-p t))
+      (cl-letf (((symbol-function 'yes-or-no-p) (lambda (_) (error "must not ask"))))
+        (should-not (org-todoist--confirm-deletes many 8))))
+    ;; 6 of 100 is just the normal confirmation
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (_) t))
+              ((symbol-function 'yes-or-no-p) (lambda (_) (error "too strict"))))
+      (should (org-todoist--confirm-deletes many 100)))))
+
+(ert-deftest org-todoist--test--many-commands-need-confirmation ()
+  (let ((cmds (cl-loop repeat 30 collect '(("type" . "item_update"))))
+        (org-todoist-command-confirm-threshold 25)
+        (asked nil))
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (_) (setq asked t) t)))
+      (should (org-todoist--confirm-deletes cmds 1000))
+      (should asked))
+    (let ((org-todoist--background-sync-p t))
+      (should-not (org-todoist--confirm-deletes cmds 1000)))
+    (let ((org-todoist-command-confirm-threshold nil))
+      (should (org-todoist--confirm-deletes cmds 1000)))))
+
+(ert-deftest org-todoist--test--known-item-count ()
+  (should (= 14 (org-todoist--known-item-count (org-todoist--generate-sample-ast))))
+  (should (= 0 (org-todoist--known-item-count nil))))
+
+(ert-deftest org-todoist--test--backup-before-push-only-when-needed ()
+  (org-todoist--test-with-storage
+    (org-todoist--test-initial-sync)
+    ;; nothing changed: no commands, no backup
+    (org-todoist--test-sync-with-responder
+     (lambda (_cmds) "{\"sync_token\":\"tok5\"}"))
+    (should-not (org-todoist--list-backups "pre-push-backup"))
+    ;; a change: the file as it was before the push is saved
+    (org-todoist--test-rename-t1 "Buy oat milk")
+    (org-todoist--test-sync-with-responder
+     (lambda (cmds) (format "{\"sync_token\":\"tok6\",\"sync_status\":%s}"
+                            (org-todoist--test-statuses cmds (lambda (_) "\"ok\"")))))
+    (let ((backups (org-todoist--list-backups "pre-push-backup")))
+      (should (= 1 (length backups)))
+      (should (string-match-p "Buy oat milk"
+                              (with-temp-buffer (insert-file-contents (car backups)) (buffer-string)))))))
+
+(ert-deftest org-todoist--test--show-pending-sends-nothing ()
+  (org-todoist--test-with-storage
+    (org-todoist--test-initial-sync)
+    (org-todoist--test-rename-t1 "Buy oat milk")
+    (cl-letf (((symbol-function 'org-todoist--api-call) (lambda (&rest _) (error "must not call the API")))
+              ((symbol-function 'display-buffer) #'ignore))
+      (should (= 1 (org-todoist-show-pending))))
+    (with-current-buffer "*org-todoist pending*"
+      (should (string-match-p "item_update" (buffer-string)))
+      (should (string-match-p "Buy oat milk" (buffer-string))))
+    (should-not org-todoist--sync-lock)))

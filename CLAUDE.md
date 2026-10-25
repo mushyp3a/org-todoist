@@ -30,10 +30,10 @@ Debug: `~/.cache/org-todoist/last-request.json`, `last-response.json`, `M-x org-
 - `org-todoist-reset` rebuilds the file from an empty AST + full sync (`org-todoist-reset-replaces-file`, default t) and saves the old file to `pre-reset-backup-DATE.org` in the storage dir (last `org-todoist-backups-to-keep`=3 kept; same for `pre-sync-backup-DATE.org`). Nil restores the old merge behaviour.
 - Commands Todoist rejects (non-add ones) are queued in `FAILED-COMMANDS.json` and re-sent on the next syncs, up to `org-todoist-command-retries`. Rejected adds are retried by the normal diff.
 - Requests time out after `org-todoist-request-timeout` (60s); the sync lock goes stale after twice that. A sync requested while one is running is queued to run after it.
-- A sync that would delete more than `org-todoist-delete-confirm-threshold` (5) items asks first; timer syncs refuse instead.
+- Safety nets before a push: >`org-todoist-delete-confirm-threshold` (3) deletes asks y/n; deleting more than half of the known items needs a typed `yes`; >`org-todoist-command-confirm-threshold` (25) commands asks. Timer syncs refuse instead of asking. Any push first saves `pre-push-backup-DATE.org`. `M-x org-todoist-show-pending` previews the commands without sending.
 - `item_move` takes exactly one of parent_id/section_id/project_id: see `org-todoist--item-move-args`. Never send a null section_id.
 - Recurring tasks completed in Emacs: `org-todoist--item-close-hook` sends `item_close`; the sync then only pushes the new due date. Don't also emit `item_close` from the diff (it would advance the task twice).
-- Lookups in `org-todoist--push` use an id index (`org-todoist--build-id-index`); `org-todoist--get-by-id` is still an O(n) walk, used when parsing responses.
+- Id lookups are indexed: `org-todoist--push` uses `org-todoist--index-lookup`; `org-todoist--parse-response` binds `org-todoist--id-index` (via `org-todoist--with-id-index`) so `org-todoist--get-by-id` is a hash lookup. Ids must be assigned through `org-todoist--add-prop` so the index sees them; outside a binding `get-by-id` still walks the tree.
 
 ## Conventions
 - **Do NOT commit.** Never run `git commit` (or push); leave changes in the working tree for the user to review and commit.

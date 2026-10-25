@@ -105,8 +105,17 @@ reset merges Todoist's state into the file as of the last sync instead."
   :type 'integer
   :group 'org-todoist)
 
-(defcustom org-todoist-delete-confirm-threshold 5
+(defcustom org-todoist-delete-confirm-threshold 3
   "Ask before a sync deletes more than this many items on Todoist.
+Background syncs skip instead of asking.  Nil never asks.
+Deleting more than half of the items Todoist knew about at the last sync
+always needs a typed \"yes\" (and background syncs always refuse): that
+almost always means the file is damaged, not that you meant it."
+  :type '(choice (const :tag "Never ask" nil) integer)
+  :group 'org-todoist)
+
+(defcustom org-todoist-command-confirm-threshold 25
+  "Ask before a sync sends more than this many commands to Todoist.
 Background syncs skip instead of asking.  Nil never asks."
   :type '(choice (const :tag "Never ask" nil) integer)
   :group 'org-todoist)
@@ -1201,16 +1210,72 @@ that failed, so only the rest are queued."
                          (assoc-default "type" cmd) status)
               (push (cons attempts cmd) org-todoist--sync-failures))))))))
 
-(defun org-todoist--confirm-deletes (COMMANDS)
-  "Return non-nil if it's OK to send COMMANDS given how many items they delete."
-  (let ((n (cl-count-if (lambda (c) (member (assoc-default "type" c)
-                                            '("item_delete" "section_delete" "project_delete")))
-                        COMMANDS)))
-    (cond ((or (null org-todoist-delete-confirm-threshold)
-               (<= n org-todoist-delete-confirm-threshold))
-           t)
-          (org-todoist--background-sync-p nil)
-          (t (y-or-n-p (format "This sync will delete %d items on Todoist. Continue? " n))))))
+(defun org-todoist--known-item-count (OLD)
+  "Number of projects, sections and tasks with ids in the snapshot tree OLD."
+  (let ((n 0))
+    (when OLD
+      (org-element-map OLD 'headline
+        (lambda (hl)
+          (when (and (org-todoist--get-prop hl org-todoist--id-property)
+                     (not (equal (org-todoist--get-prop hl org-todoist--id-property)
+                                 org-todoist--default-id)))
+            (cl-incf n)))))
+    n))
+
+(defun org-todoist--confirm-deletes (COMMANDS &optional KNOWN)
+  "Return non-nil if it's OK to send COMMANDS.
+Asks (or, for background syncs, refuses) when they delete many items or are
+simply very numerous.  KNOWN is the number of items at the last sync."
+  (let ((deletes (cl-count-if (lambda (c) (member (assoc-default "type" c)
+                                                  '("item_delete" "section_delete" "project_delete")))
+                              COMMANDS))
+        (total (length COMMANDS)))
+    (cond
+     ;; Most of everything deleted: almost certainly a damaged or wrong file.
+     ((and org-todoist-delete-confirm-threshold KNOWN (> deletes 3) (> (* 2 deletes) KNOWN))
+      (and (not org-todoist--background-sync-p)
+           (yes-or-no-p (format "This sync will DELETE %d of the %d items you have on Todoist. Is the file right? "
+                                deletes KNOWN))))
+     ((and org-todoist-delete-confirm-threshold (> deletes org-todoist-delete-confirm-threshold))
+      (and (not org-todoist--background-sync-p)
+           (y-or-n-p (format "This sync will delete %d items on Todoist. Continue? " deletes))))
+     ((and org-todoist-command-confirm-threshold (> total org-todoist-command-confirm-threshold))
+      (and (not org-todoist--background-sync-p)
+           (y-or-n-p (format "This sync will send %d changes to Todoist. Continue? " total))))
+     (t t))))
+
+(defun org-todoist--command-summary (COMMAND)
+  "A one-line description of the sync API COMMAND."
+  (let* ((args (assoc-default "args" COMMAND))
+         (what (or (assoc-default "content" args) (assoc-default "name" args)
+                   (assoc-default "id" args) "")))
+    (format "%-16s %s%s" (assoc-default "type" COMMAND) what
+            (let ((extra (--remove (member (car it) '("id" "content" "name" "description"))
+                                   (if (listp args) args nil))))
+              (if extra (format "  %s" (mapconcat (lambda (a) (format "%s=%S" (car a) (cdr a))) extra " ")) "")))))
+
+;;;###autoload
+(defun org-todoist-show-pending ()
+  "Show what the next sync would send to Todoist, without sending anything."
+  (interactive)
+  (let* ((old (org-todoist--get-last-sync-buffer-ast))
+         (commands (append (org-todoist--read-retry-queue-commands)
+                           (org-todoist--push (org-todoist--file-ast) old)))
+         (buf (get-buffer-create "*org-todoist pending*")))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (format "Next sync would send %d command(s)%s:\n\n" (length commands)
+                        (if old "" " (no snapshot yet: nothing is pushed for existing items)")))
+        (dolist (c commands) (insert (org-todoist--command-summary c) "\n"))
+        (goto-char (point-min))
+        (special-mode)))
+    (display-buffer buf)
+    (length commands)))
+
+(defun org-todoist--read-retry-queue-commands ()
+  "Commands waiting in the retry queue, without their attempt counts."
+  (mapcar #'cdr (org-todoist--read-retry-queue)))
 
 (defun org-todoist--do-sync-request (TOKEN OPEN &optional REPLACE)
   "Build and send the sync request.
@@ -1221,15 +1286,17 @@ TOKEN, OPEN and REPLACE are as in `org-todoist--do-sync'."
   (when REPLACE (org-todoist--write-retry-queue nil))
   (let* ((cur-marker (point-marker))
          (ast (if REPLACE (org-todoist--empty-ast) (org-todoist--file-ast)))
+         (old (unless (equal TOKEN "*") (org-todoist--get-last-sync-buffer-ast)))
          (commands (if (equal TOKEN "*")
                        ;; For reset syncs, don't send any commands to preserve local changes
                        []
                      ;; Normal sync - re-send rejected commands, then diff against last state
-                     (let ((old (org-todoist--get-last-sync-buffer-ast)))
-                       (append (org-todoist--take-queued-commands)
-                               (org-todoist--push ast old)))))
-         (_ (unless (org-todoist--confirm-deletes commands)
-              (user-error "Sync cancelled: too many deletions pending (see `org-todoist-delete-confirm-threshold')")))
+                     (append (org-todoist--take-queued-commands)
+                             (org-todoist--push ast old))))
+         (_ (unless (org-todoist--confirm-deletes commands (org-todoist--known-item-count old))
+              (user-error "Sync cancelled: too many changes pending (see `org-todoist-show-pending')")))
+         (_ (when (and commands (not REPLACE) (file-exists-p (org-todoist-file)))
+              (org-todoist--backup-file "pre-push-backup")))
          (request-data `(("sync_token" . ,TOKEN)
                          ("resource_types" . ,(json-encode org-todoist-resource-types))
                          ("commands" . ,commands))))
@@ -2097,6 +2164,32 @@ the project's default (unsectioned) section."
               append (seq-filter (lambda (c) (equal type (assoc-default "type" c))) commands))
      (seq-remove (lambda (c) (member (assoc-default "type" c) add-types)) commands))))
 
+(defvar org-todoist--id-index nil
+  "Hash table of id -> headlines, bound while a response is being applied.
+When non-nil, `org-todoist--get-by-id' uses it instead of walking the tree.
+`org-todoist--add-prop' keeps it up to date as ids are assigned.")
+
+(defun org-todoist--within-p (NODE SCOPE)
+  "Non-nil if NODE is SCOPE or one of its descendants."
+  (let ((cur NODE))
+    (while (and cur (not (eq cur SCOPE)))
+      (setq cur (org-element-parent cur)))
+    (and cur t)))
+
+(defun org-todoist--index-add (NODE)
+  "Record headline NODE in `org-todoist--id-index' under its current id."
+  (when-let* ((index org-todoist--id-index)
+              (id (org-todoist--get-prop NODE org-todoist--id-property)))
+    (let ((existing (gethash id index)))
+      (unless (memq NODE existing)
+        (puthash id (append existing (list NODE)) index)))))
+
+(defmacro org-todoist--with-id-index (AST &rest body)
+  "Run BODY with `org-todoist--id-index' built for the syntax tree AST."
+  (declare (indent 1))
+  `(let ((org-todoist--id-index (org-todoist--build-id-index ,AST)))
+     ,@body))
+
 (defun org-todoist--is-subtask (NODE)
   "If NODE is a headline representing a subtask."
   (org-todoist--get-parent-of-type org-todoist--task-type NODE t))
@@ -2124,11 +2217,12 @@ the project's default (unsectioned) section."
         (tid_mapping (assoc-default 'temp_id_mapping RESPONSE)))
     (org-todoist--backup-if-edited)
     (org-todoist--temp-id-mapping tid_mapping AST)
-    (org-todoist--update-users collab AST)
-    (org-todoist--update-projects projects AST)
-    (org-todoist--update-sections sections AST)
-    (org-todoist--update-tasks tasks AST)
-    (org-todoist--update-comments comments AST)
+    (org-todoist--with-id-index AST
+      (org-todoist--update-users collab AST)
+      (org-todoist--update-projects projects AST)
+      (org-todoist--update-sections sections AST)
+      (org-todoist--update-tasks tasks AST)
+      (org-todoist--update-comments comments AST))
     ;; Persist the token last: if anything above or below fails, the next sync
     ;; re-fetches these changes instead of losing them.
     (prog1 (org-todoist--update-file AST)
@@ -2750,12 +2844,18 @@ QUERY takes a single argument which is the current node."
 (defun org-todoist--get-by-id (TYPE ID AST)
   "Find the first item of TODOIST_TYPE TYPE with ID in the syntax tree AST."
   (when ID
-    (org-element-map AST 'headline
-      (lambda (hl) (when (and (or (null TYPE)
-                                  (string-equal (org-todoist--get-prop hl org-todoist--type) TYPE))
-                              (string= (org-todoist--get-prop hl org-todoist--id-property) ID))
-                     hl))
-      nil t)))
+    (if org-todoist--id-index
+        (--first (and (or (null TYPE)
+                          (string-equal (org-todoist--get-prop it org-todoist--type) TYPE))
+                      (equal (org-todoist--get-prop it org-todoist--id-property) ID)
+                      (org-todoist--within-p it AST))
+                 (gethash ID org-todoist--id-index))
+      (org-element-map AST 'headline
+        (lambda (hl) (when (and (or (null TYPE)
+                                    (string-equal (org-todoist--get-prop hl org-todoist--type) TYPE))
+                                (string= (org-todoist--get-prop hl org-todoist--id-property) ID))
+                       hl))
+        nil t))))
 
 (defun org-todoist--build-id-index (AST)
   "Return a hash table of headline id -> headlines (document order) for AST."
@@ -2890,6 +2990,8 @@ Replaces the current value with VALUE if property KEY already exists."
                (setq drawer (org-element-create 'property-drawer))
                (org-todoist--adopt-drawer headline drawer))
              (org-todoist--set-prop-in-place drawer key value)
+             (when (and org-todoist--id-index (equal key org-todoist--id-property))
+               (org-todoist--index-add headline))
              drawer))
           (t (signal 'todoist--error "Called org-todoist--add-prop with invalid type")))))
 
