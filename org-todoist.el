@@ -1000,14 +1000,17 @@ OPEN determines whether the Todoist buffer should be opened after sync."
                              (lambda (response _ ast _)
                                (if (null response)
                                    (message "Batch failed. See org-todoist--sync-err for details.")
-                                 (when-let* ((parsed (org-todoist--parse-response response ast))
-                                             (new-token (assoc-default 'sync_token response))
-                                             (new-temp-ids (assoc-default 'temp_id_mapping response)))
-                                   (if (cdr batches-left)
+                                 (let ((new-token (assoc-default 'sync_token response))
+                                       (new-temp-ids (assoc-default 'temp_id_mapping response)))
+                                   (org-todoist--parse-response response ast)
+                                   (cond
+                                    ((null new-token)
+                                     (message "Batch response had no sync token; stopping."))
+                                    ((cdr batches-left)
                                        (progn
                                          (message "Batch complete. %d remaining..." (length (cdr batches-left)))
-                                         (process-batch (cdr batches-left) new-token (append temp-id-map new-temp-ids)))
-                                     (message "Sync complete.")))))
+                                         (process-batch (cdr batches-left) new-token (append temp-id-map new-temp-ids))))
+                                    (t (message "Sync complete."))))))
                              `(,OPEN ,ast ,cur-marker))))))
             (process-batch batches TOKEN nil)
             (org-todoist--handle-display cur-marker)))))))
@@ -1757,19 +1760,16 @@ EFF is the effort number in minutes."
                             commands)))))))))))
 
     ;; Since commands may be batched, we need to ensure that new items are always added first.
-    (let ((sorted-commands
-           (append
-            ;; Project adds first
-            (--filter (string= "project_add" (assoc-default 'type it)) commands)
-            ;; Section adds second
-            (--filter (string= "section_add" (assoc-default 'type it)) commands)
-            ;; Item adds third
-            (--filter (string= "item_add" (assoc-default 'type it)) commands)
-            ;; All other commands last
-            (--filter (not (member (assoc-default 'type it)
-                                   '("project_add" "section_add" "item_add")))
-                      commands))))
-      sorted-commands)))
+    ;; COMMANDS was built with `push', so restore walk order (parents before children) first.
+    (org-todoist--sort-commands (reverse commands))))
+
+(defun org-todoist--sort-commands (commands)
+  "Stable-sort COMMANDS so that project, section and item adds come first."
+  (let ((add-types '("project_add" "section_add" "item_add")))
+    (append
+     (cl-loop for type in add-types
+              append (seq-filter (lambda (c) (equal type (assoc-default "type" c))) commands))
+     (seq-remove (lambda (c) (member (assoc-default "type" c) add-types)) commands))))
 
 (defun org-todoist--is-subtask (NODE)
   "If NODE is a headline representing a subtask."
@@ -2690,26 +2690,26 @@ ARG is passed to `org-todoist--do-reset' if confirmed."
 
 (defun org-todoist--batch-commands (commands)
   "Split COMMANDS into chunks of `org-todoist-command-batch-size'."
-  (let ((max-batch-size org-todoist-command-batch-size))
-    (cl-loop for i from 0 to (length commands) by max-batch-size
-             collect (seq-subseq commands i (min (+ i max-batch-size) (length commands))))))
+  (seq-partition commands org-todoist-command-batch-size))
 
 (defun org-todoist--replace-temp-ids (commands temp-id-map)
-  "Replace temporary IDs in COMMANDS with real IDs from TEMP-ID-MAP."
-  (cl-loop for cmd in commands collect
-           (cl-loop for (key . value) in cmd
-                    if (eq key 'args)
-                    collect (cons key (org-todoist--map-replace-temp-ids value temp-id-map))
-                    else collect (cons key value))))
+  "Replace temporary IDs in COMMANDS with real IDs from TEMP-ID-MAP.
+Keys of TEMP-ID-MAP may be strings or symbols."
+  (let ((map (--map (cons (format "%s" (car it)) (cdr it)) temp-id-map)))
+    (cl-loop for cmd in commands collect
+             (cl-loop for (key . value) in cmd
+                      if (equal key "args")
+                      collect (cons key (org-todoist--map-replace-temp-ids value map))
+                      else collect (cons key value)))))
 
 (defun org-todoist--map-replace-temp-ids (args temp-id-map)
-  "Recursively replace temp IDs in ARGS using TEMP-ID-MAP."
-  (cl-loop for (k . v) in args
-           collect (cons k (if (stringp v)
-                               (or (cdr (assoc v temp-id-map)) v)
-                             (if (listp v)
-                                 (org-todoist--map-replace-temp-ids v temp-id-map)
-                               v)))))
+  "Recursively replace temp IDs in ARGS using TEMP-ID-MAP (string keys)."
+  (cond
+   ((stringp args) (or (cdr (assoc args temp-id-map)) args))
+   ((consp args)
+    (cons (org-todoist--map-replace-temp-ids (car args) temp-id-map)
+          (org-todoist--map-replace-temp-ids (cdr args) temp-id-map)))
+   (t args)))
 
 (defun org-todoist--id-is-v9 (id)
   "String ID is composed of only numbers."

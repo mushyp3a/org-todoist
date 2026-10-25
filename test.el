@@ -592,3 +592,30 @@ paragraph
                        (is_archived . :json-false)
                        (archived_at)
                        (added_at . "2019-10-07T07:09:27.000000Z")))
+
+;; Command ordering and temp-id replacement
+
+(ert-deftest org-todoist--test--sort-commands ()
+  (let* ((mk (lambda (type id) `(("type" . ,type) ("uuid" . ,id))))
+         (cmds (list (funcall mk "item_update" "u1")
+                     (funcall mk "item_add" "i1")
+                     (funcall mk "project_add" "p1")
+                     (funcall mk "item_add" "i2")
+                     (funcall mk "section_add" "s1")))
+         (sorted (mapcar (lambda (c) (assoc-default "uuid" c))
+                         (org-todoist--sort-commands cmds))))
+    (should (equal sorted '("p1" "s1" "i1" "i2" "u1")))))
+
+(ert-deftest org-todoist--test--replace-temp-ids ()
+  (let* ((cmds '((("type" . "item_add")
+                  ("args" . (("project_id" . "tmp-p") ("labels" . ("a" "tmp-p")) ("content" . "x"))))))
+         (out (org-todoist--replace-temp-ids cmds '((tmp-p . "123")))))
+    (should (equal (assoc-default "project_id" (assoc-default "args" (car out))) "123"))
+    (should (equal (assoc-default "labels" (assoc-default "args" (car out))) '("a" "123")))
+    (should (equal (assoc-default "content" (assoc-default "args" (car out))) "x"))))
+
+(ert-deftest org-todoist--test--batch-commands ()
+  (let ((org-todoist-command-batch-size 2))
+    (should (equal (org-todoist--batch-commands '(1 2 3 4)) '((1 2) (3 4))))
+    (should (equal (org-todoist--batch-commands '(1 2 3)) '((1 2) (3))))
+    (should (null (org-todoist--batch-commands nil)))))
