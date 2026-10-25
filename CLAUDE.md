@@ -27,6 +27,7 @@ Debug: `~/.cache/org-todoist/last-request.json`, `last-response.json`, `M-x org-
 - The buffer is fully rewritten after each sync. It is made read-only while a sync is in flight (`org-todoist--freeze-buffer`); if it changed anyway the old contents are saved to `pre-sync-backup.org` in the storage dir.
 - A sync lock (`org-todoist--sync-lock`) prevents overlapping syncs; failures land in `org-todoist--sync-err`.
 - Persist order after a response is file -> snapshot -> token.
+- `org-todoist-reset` rebuilds the file from an empty AST + full sync (`org-todoist-reset-replaces-file`, default t) and saves the old file to `pre-reset-backup.org` in the storage dir. Nil restores the old merge behaviour.
 - `item_move` takes exactly one of parent_id/section_id/project_id: see `org-todoist--item-move-args`. Never send a null section_id.
 - Recurring tasks completed in Emacs: `org-todoist--item-close-hook` sends `item_close`; the sync then only pushes the new due date. Don't also emit `item_close` from the diff (it would advance the task twice).
 - Lookups in `org-todoist--push` use an id index (`org-todoist--build-id-index`); `org-todoist--get-by-id` is still an O(n) walk, used when parsing responses.

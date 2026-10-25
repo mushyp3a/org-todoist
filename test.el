@@ -958,3 +958,56 @@ unsectioned tasks)."
                                   "**** TODO Added after\n"))))
          (types (mapcar #'car (org-todoist--test-push new old))))
     (should (equal types '("item_add" "item_update")))))
+
+;; reset replaces the file
+
+(defun org-todoist--test-file-string ()
+  (with-temp-buffer (insert-file-contents org-todoist-file) (buffer-string)))
+
+(ert-deftest org-todoist--test--reset-replaces-file ()
+  (org-todoist--test-with-storage
+    (let ((org-todoist-api-token "x")
+          (org-todoist-reset-replaces-file t))
+      ;; a local file with a stale task Todoist no longer has, plus local-only notes
+      (with-temp-file org-todoist-file
+        (insert "#+title: Todoist\n* Proj\n:PROPERTIES:\n:TODOIST_TYPE: PROJECT\n:tid: p1\n:END:\n"
+                "** Sec\n:PROPERTIES:\n:TODOIST_TYPE: SECTION\n:tid: s1\n:END:\n"
+                "*** TODO Stale duplicate\n:PROPERTIES:\n:TODOIST_TYPE: TASK\n:tid: old1\n:END:\n"
+                "*** TODO Buy milk\n:PROPERTIES:\n:TODOIST_TYPE: TASK\n:tid: t1\n:END:\nlocal-only clock notes\n"))
+      (org-todoist--set-last-sync-buffer (org-todoist--generate-ast (org-todoist--test-file-string)))
+      (cl-letf (((symbol-function 'org-todoist--api-call)
+                 (lambda (_data cb &optional args _sync)
+                   (apply cb (cons (json-read-from-string org-todoist--test-response) args))))
+                ((symbol-function 'org-todoist--handle-display) #'ignore))
+        (org-todoist--do-reset t))
+      (let ((new (org-todoist--test-file-string))
+            (backup (with-temp-buffer
+                      (insert-file-contents (org-todoist--storage-file "pre-reset-backup.org"))
+                      (buffer-string))))
+        (should (string-match-p "Buy milk" new))
+        (should (string-match-p "tid: *t2" new))
+        (should-not (string-match-p "Stale duplicate" new))
+        (should-not (string-match-p "local-only clock notes" new))
+        ;; the old file is kept
+        (should (string-match-p "Stale duplicate" backup))
+        (should (string-match-p "local-only clock notes" backup)))
+      (should (equal (org-todoist--get-sync-token) "tok2"))
+      (should-not org-todoist--sync-lock)
+      (should-not (org-todoist--push (org-todoist--file-ast) (org-todoist--get-last-sync-buffer-ast))))))
+
+(ert-deftest org-todoist--test--reset-can-merge-instead ()
+  (org-todoist--test-with-storage
+    (let ((org-todoist-api-token "x")
+          (org-todoist-reset-replaces-file nil))
+      (with-temp-file org-todoist-file
+        (insert "#+title: Todoist\n* Proj\n:PROPERTIES:\n:TODOIST_TYPE: PROJECT\n:tid: p1\n:END:\n"
+                "** Sec\n:PROPERTIES:\n:TODOIST_TYPE: SECTION\n:tid: s1\n:END:\n"
+                "*** TODO Kept\n:PROPERTIES:\n:TODOIST_TYPE: TASK\n:tid: old1\n:END:\n"))
+      (org-todoist--set-last-sync-buffer (org-todoist--generate-ast (org-todoist--test-file-string)))
+      (cl-letf (((symbol-function 'org-todoist--api-call)
+                 (lambda (_data cb &optional args _sync)
+                   (apply cb (cons (json-read-from-string org-todoist--test-response) args))))
+                ((symbol-function 'org-todoist--handle-display) #'ignore))
+        (org-todoist--do-reset t))
+      (should (string-match-p "Kept" (org-todoist--test-file-string)))
+      (should-not (file-exists-p (org-todoist--storage-file "pre-reset-backup.org"))))))

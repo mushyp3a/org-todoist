@@ -86,6 +86,15 @@ This value must fall between `org-priority-lowest' and `org-priority-highest'."
   :type '(choice (const nil) string)
   :group 'org-todoist)
 
+(defcustom org-todoist-reset-replaces-file t
+  "If non-nil, `org-todoist-reset' rebuilds the file purely from Todoist.
+Anything only stored locally (clocking, ignored sub-trees, unsynced edits and
+tasks Todoist no longer has) is dropped; the old file is saved to
+\"pre-reset-backup.org\" in `org-todoist-storage-dir' first.  If nil, the
+reset merges Todoist's state into the file as of the last sync instead."
+  :type 'boolean
+  :group 'org-todoist)
+
 (defcustom org-todoist-delete-remote-items nil
   "Delete items on Todoist when deleted from the variable `org-todoist-file'.
 WARNING items archived to sibling files will be detected as deleted!"
@@ -963,12 +972,18 @@ Optional argument SYNC-REQUEST forces a synchronous call."
 Returns non-nil if a backup was written."
   (when (and org-todoist--sync-start-hash
              (not (equal org-todoist--sync-start-hash (org-todoist--buffer-hash))))
-    (let ((backup (org-todoist--storage-file "pre-sync-backup.org")))
-      (if-let* ((buf (find-buffer-visiting (org-todoist-file))))
-          (with-current-buffer buf (write-region nil nil backup nil 'silent))
-        (copy-file (org-todoist-file) backup t))
-      (message "Todoist file was edited during the sync; previous contents saved to %s" backup)
-      t)))
+    (message "Todoist file was edited during the sync; previous contents saved to %s"
+             (org-todoist--backup-file "pre-sync-backup.org"))
+    t))
+
+(defun org-todoist--backup-file (NAME)
+  "Save the current contents of the Todoist file as NAME in the storage dir.
+Returns the path of the backup."
+  (let ((backup (org-todoist--storage-file NAME)))
+    (if-let* ((buf (find-buffer-visiting (org-todoist-file))))
+        (with-current-buffer buf (write-region nil nil backup nil 'silent))
+      (copy-file (org-todoist-file) backup t))
+    backup))
 
 (defun org-todoist--acquire-sync-lock ()
   "Take the sync lock.  Return nil if another sync is in flight."
@@ -1006,31 +1021,43 @@ Uses curl if available, otherwise falls back to `url-retrieve'."
       (message "Skipping background sync with Todoist servers since buffer is active...")
     (org-todoist-sync t)))
 
-(defun org-todoist--do-sync (TOKEN OPEN)
+(defun org-todoist--do-sync (TOKEN OPEN &optional REPLACE)
   "Diff the Todoist org file, perform the API request, and update the file.
 TOKEN is the previous incremental sync token.
-OPEN determines whether the Todoist buffer should be opened after sync."
+OPEN determines whether the Todoist buffer should be opened after sync.
+With REPLACE, build the file from scratch using the response, after
+backing up the current file."
   (when (or (null org-todoist-api-token) (not (stringp org-todoist-api-token)))
     (user-error "No org-todoist-api-token API token set"))
   (unless (org-todoist--is-current-api)
     (user-error "Org todoist has updated API versions! Run 'org-todoist-migrate-to-v1' to continue using org-todoist"))
   (if (not (org-todoist--acquire-sync-lock))
       (message "A Todoist sync is already in progress; skipping.")
-    (org-todoist--do-sync-locked TOKEN OPEN)))
+    (org-todoist--do-sync-locked TOKEN OPEN REPLACE)))
 
-(defun org-todoist--do-sync-locked (TOKEN OPEN)
+(defun org-todoist--do-sync-locked (TOKEN OPEN &optional REPLACE)
   "Body of `org-todoist--do-sync' once the sync lock is held.
-TOKEN and OPEN are as in `org-todoist--do-sync'."
+TOKEN, OPEN and REPLACE are as in `org-todoist--do-sync'."
   (setq org-todoist--sync-err nil)
   (condition-case err
-      (org-todoist--do-sync-request TOKEN OPEN)
+      (org-todoist--do-sync-request TOKEN OPEN REPLACE)
     (error (org-todoist--release-sync-lock)
            (signal (car err) (cdr err)))))
 
-(defun org-todoist--do-sync-request (TOKEN OPEN)
-  "Build and send the sync request.  TOKEN and OPEN as in `org-todoist--do-sync'."
+(defun org-todoist--empty-ast ()
+  "Return the syntax tree of a Todoist file that has only its header."
+  (with-temp-buffer
+    (org-todoist--insert-header)
+    (org-mode)
+    (org-element-parse-buffer)))
+
+(defun org-todoist--do-sync-request (TOKEN OPEN &optional REPLACE)
+  "Build and send the sync request.
+TOKEN, OPEN and REPLACE are as in `org-todoist--do-sync'."
+  (when (and REPLACE (file-exists-p (org-todoist-file)))
+    (org-todoist--backup-file "pre-reset-backup.org"))
   (let* ((cur-marker (point-marker))
-         (ast (org-todoist--file-ast))
+         (ast (if REPLACE (org-todoist--empty-ast) (org-todoist--file-ast)))
          (commands (if (equal TOKEN "*")
                        ;; For reset syncs, don't send any commands to preserve local changes
                        []
@@ -2805,9 +2832,9 @@ This indicates v9 API IDs."
   "Sync with a full reset token and overwrite the SYNC-BUFFER.
 ARG is passed to `org-todoist--do-sync'."
   (let ((sb (org-todoist--storage-file org-todoist--sync-buffer-file)))
-    (when (file-exists-p sb)
+    (when (and (not org-todoist-reset-replaces-file) (file-exists-p sb))
       (copy-file sb (org-todoist-file) t))
-    (org-todoist--do-sync "*" (null ARG))))
+    (org-todoist--do-sync "*" (null ARG) org-todoist-reset-replaces-file)))
 
 (defun org-todoist--verify-changes-before-reset (&optional ARG)
   "Verify diff with user before performing a full sync reset.
@@ -3552,7 +3579,9 @@ With double prefix ARG, delete the previous todoist file.
 NOTE this will irreversibly discard all data not stored in Todoist
 \(e.g., time tracking information and ignored sub-trees.\).
 
-Local changes that haven't been synced will be preserved during reset."
+By default (see `org-todoist-reset-replaces-file') the file is rebuilt
+entirely from Todoist and the old file is saved to \"pre-reset-backup.org\"
+in `org-todoist-storage-dir'.  Unsynced local changes are lost."
   (interactive "P")
   (if (and (not (eql 16 (car ARG)))
            (file-exists-p (org-todoist--storage-file org-todoist--sync-buffer-file)))
